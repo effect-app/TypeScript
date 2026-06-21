@@ -2070,10 +2070,41 @@ export function transformDeclarations(context: TransformationContext): Transform
     }
 
     function isEffectSchemaOpaqueExpression(expression: Node) {
-        return isPropertyAccessExpression(expression)
-            && (idText(expression.name) === "Opaque" || idText(expression.name) === "OpaqueFacade")
-            && expression.expression.kind === SyntaxKind.Identifier
-            && (idText(expression.expression as Identifier) === "S" || idText(expression.expression as Identifier) === "Schema");
+        return !!getEffectSchemaCtorFacadeName(expression);
+    }
+
+    // Maps a schema-model heritage constructor (`S.Opaque(...)`, `S.Class(...)`, `S.ErrorClass(...)`,
+    // ...) to the effect-app facade type its base should be rewritten to. Returns undefined for
+    // non-model constructors. The Opaque family (incl. requests, built on Opaque) -> `OpaqueFacade`;
+    // the class family -> `OpaqueClassFacade`; the error family -> `OpaqueErrorFacadeClass`.
+    function getEffectSchemaCtorFacadeName(expression: Node): string | undefined {
+        if (
+            !isPropertyAccessExpression(expression)
+            || expression.expression.kind !== SyntaxKind.Identifier
+            || (idText(expression.expression as Identifier) !== "S" && idText(expression.expression as Identifier) !== "Schema")
+        ) {
+            return undefined;
+        }
+        switch (idText(expression.name)) {
+            case "Opaque":
+            case "OpaqueFacade":
+                return "OpaqueFacade";
+            case "Class":
+            case "TaggedClass":
+                return "OpaqueClassFacade";
+            case "ErrorClass":
+            case "TaggedErrorClass":
+                return "OpaqueErrorFacadeClass";
+            default:
+                return undefined;
+        }
+    }
+
+    function getEffectSchemaClassFacadeName(classDeclaration: ClassDeclaration): string {
+        let expression: Node | undefined = classDeclaration.heritageClauses?.[0]?.types[0]?.expression;
+        if (expression?.kind === SyntaxKind.CallExpression) expression = (expression as unknown as { expression: Node }).expression;
+        if (expression?.kind === SyntaxKind.CallExpression) expression = (expression as unknown as { expression: Node }).expression;
+        return (expression && getEffectSchemaCtorFacadeName(expression)) || "OpaqueFacade";
     }
 
     function isEffectSchemaModelNamespace(statement: Statement): statement is ModuleDeclaration & { name: Identifier } {
@@ -2260,7 +2291,7 @@ export function transformDeclarations(context: TransformationContext): Transform
             declaration,
             usesIntermediateClass ? factory.createIdentifier(`__${modelName}_base`) : declaration.name,
             declaration.exclamationToken,
-            createEffectSchemaFacadeBaseType(modelName, classDeclaration),
+            createEffectSchemaFacadeBaseType(modelName, classDeclaration, declaration.type),
             declaration.initializer,
         );
         return factory.updateVariableStatement(
@@ -2396,15 +2427,30 @@ export function transformDeclarations(context: TransformationContext): Transform
         );
     }
 
-    function createEffectSchemaFacadeBaseType(modelName: string, classDeclaration: ClassDeclaration): TypeNode {
+    function createEffectSchemaFacadeBaseType(modelName: string, classDeclaration: ClassDeclaration, baseType: TypeNode | undefined): TypeNode {
+        const facadeName = getEffectSchemaClassFacadeName(classDeclaration);
+        const brandType = getEffectSchemaFacadeBrandType(baseType, facadeName);
         const schemaStaticMembers = createEffectSchemaStaticMembers(classDeclaration);
         return factory.createIntersectionTypeNode([
-            createEffectSchemaFacadeTypeReference(modelName, factory.createTypeLiteralNode([])),
+            createEffectSchemaFacadeTypeReference(modelName, brandType, facadeName),
             factory.createTypeLiteralNode(schemaStaticMembers),
         ]);
     }
 
-    function createEffectSchemaFacadeTypeReference(modelName: string, brandType: TypeNode): TypeReferenceNode {
+    // The facade's Brand (last type arg). For the class/error families the source base is
+    // `S.EnhancedClass<Self, Schema, Inherited>` — the 3rd arg is the brand (e.g. `Cause.YieldableError`
+    // for errors); preserve it. The Opaque family carries no brand on the base, so use `{}`.
+    function getEffectSchemaFacadeBrandType(baseType: TypeNode | undefined, facadeName: string): TypeNode {
+        const empty = factory.createTypeLiteralNode([]);
+        if (facadeName === "OpaqueFacade" || !baseType) return empty;
+        let typeNode: TypeNode | undefined = baseType;
+        if (typeNode.kind === SyntaxKind.IntersectionType) typeNode = (typeNode as IntersectionTypeNode).types[0];
+        if (!typeNode || typeNode.kind !== SyntaxKind.TypeReference) return empty;
+        const args = (typeNode as TypeReferenceNode).typeArguments;
+        return args && args.length >= 3 ? args[2] : empty;
+    }
+
+    function createEffectSchemaFacadeTypeReference(modelName: string, brandType: TypeNode, facadeName: string = "OpaqueFacade"): TypeReferenceNode {
         const model = factory.createIdentifier(modelName);
         const typeArguments: TypeNode[] = [
             factory.createTypeReferenceNode(model),
@@ -2414,7 +2460,7 @@ export function transformDeclarations(context: TransformationContext): Transform
             factory.createTypeReferenceNode(factory.createQualifiedName(model, factory.createIdentifier("EncodingServices"))),
             brandType,
         ];
-        const typeReference = factory.createTypeReferenceNode(factory.createQualifiedName(factory.createIdentifier("S"), factory.createIdentifier("OpaqueFacade")), typeArguments);
+        const typeReference = factory.createTypeReferenceNode(factory.createQualifiedName(factory.createIdentifier("S"), factory.createIdentifier(facadeName)), typeArguments);
         for (const typeArgument of typeArguments) {
             setParent(typeArgument, typeReference);
         }
