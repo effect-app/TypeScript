@@ -116,6 +116,8 @@ import {
     isGlobalScopeAugmentation,
     isIdentifierText,
     isImportEqualsDeclaration,
+    isCallExpression,
+    isIdentifier,
     isIndexSignatureDeclaration,
     isInterfaceDeclaration,
     isInternalDeclaration,
@@ -151,6 +153,7 @@ import {
     isTypeQueryNode,
     isVarAwaitUsing,
     isVariableDeclaration,
+    isVariableStatement,
     isVarUsing,
     LateBoundDeclaration,
     LateVisibilityPaintedStatement,
@@ -209,6 +212,7 @@ import {
     tryCast,
     TypeAliasDeclaration,
     TypeElement,
+    TypeLiteralNode,
     TypeNode,
     TypeParameterDeclaration,
     TypeQueryNode,
@@ -1950,7 +1954,19 @@ export function transformDeclarations(context: TransformationContext): Transform
                 modelNames.add(className);
             }
         }
-        if (!modelNames.size && !requestBaseInfos.size) return [...statements];
+        // Top-level `const X = S.Struct(...)` / `S.TaggedStruct(...)` schema values. These
+        // have no backing class, so they get faceted on the const itself: the giant
+        // `S.Struct<{...}>` annotation becomes `S.OpaqueFacade<X, X.Encoded, ...>` plus a
+        // generated `interface X` (decoded) and `namespace X` (Encoded/Make/services),
+        // mirroring how an Opaque class emits. Skip any name already handled as a class
+        // model or request (a struct const never shares a name with those).
+        const structModelNames = new Set<string>();
+        for (const name of getEffectSchemaOriginalStructs()) {
+            if (modelNames.has(name) || requestBaseInfos.has(name)) continue;
+            if (hasTopLevelInterface(statements, name) || hasTopLevelNamespace(statements, name)) continue;
+            if (canCreateEffectSchemaGeneratedStructNamespace(name)) structModelNames.add(name);
+        }
+        if (!modelNames.size && !requestBaseInfos.size && !structModelNames.size) return [...statements];
 
         let changed = false;
         const next: Statement[] = [];
@@ -2040,6 +2056,20 @@ export function transformDeclarations(context: TransformationContext): Transform
                     }
                     continue;
                 }
+            }
+            const structName = getEffectSchemaStructVariableName(statement);
+            if (structName && structModelNames.has(structName)) {
+                const declarations = createEffectSchemaStructDeclarations(statement as VariableStatement, structName);
+                if (declarations) {
+                    changed = true;
+                    for (const declaration of declarations) next.push(declaration);
+                    continue;
+                }
+            }
+            if (isEffectSchemaStructCompanionTypeAlias(statement, structModelNames)) {
+                // Dropped — replaced by the generated `interface X`.
+                changed = true;
+                continue;
             }
             next.push(statement);
         }
@@ -2268,6 +2298,190 @@ export function transformDeclarations(context: TransformationContext): Transform
             /*typeParameters*/ undefined,
             serviceType,
         );
+    }
+
+    // --- Struct/TaggedStruct const faceting ------------------------------------
+
+    // Top-level `const X = S.Struct(...)` / `S.TaggedStruct(...)` in the source file.
+    function getEffectSchemaOriginalStructs(): Set<string> {
+        const structs = new Set<string>();
+        for (const statement of currentSourceFile.statements) {
+            if (!isVariableStatement(statement)) continue;
+            if (statement.declarationList.declarations.length !== 1) continue;
+            const declaration = statement.declarationList.declarations[0];
+            if (!declaration || declaration.name.kind !== SyntaxKind.Identifier || !declaration.initializer) continue;
+            if (isEffectSchemaStructInitializer(declaration.initializer)) structs.add(idText(declaration.name));
+        }
+        return structs;
+    }
+
+    function isEffectSchemaStructInitializer(expression: Expression): boolean {
+        if (!isCallExpression(expression)) return false;
+        const callee = expression.expression;
+        if (!isPropertyAccessExpression(callee) || callee.name.kind !== SyntaxKind.Identifier) return false;
+        const name = idText(callee.name);
+        if (name !== "Struct" && name !== "TaggedStruct") return false;
+        // Qualifier must be `S` or `Schema` (the effect-app schema namespace import).
+        return isIdentifier(callee.expression) && (idText(callee.expression) === "S" || idText(callee.expression) === "Schema");
+    }
+
+    // Name of a `const X = ...` variable statement, if it is a single-identifier const.
+    function getEffectSchemaStructVariableName(statement: Statement): string | undefined {
+        if (!isVariableStatement(statement) || statement.declarationList.declarations.length !== 1) return;
+        const declaration = statement.declarationList.declarations[0];
+        if (!declaration || declaration.name.kind !== SyntaxKind.Identifier) return;
+        return idText(declaration.name);
+    }
+
+    // Materialize a member of the source struct value's type (`(typeof X)["prop"]`) into a
+    // concrete type literal. The checker resolves `typeof X` against the ORIGINAL source
+    // binding (the `S.Struct(...)` const), not the rewritten facade we emit, so there is no
+    // circularity. Returns undefined when the member is absent or not an object literal
+    // (e.g. `never` services).
+    function getEffectSchemaSourceStructDeclaration(modelName: string): VariableDeclaration | undefined {
+        for (const statement of currentSourceFile.statements) {
+            if (!isVariableStatement(statement) || statement.declarationList.declarations.length !== 1) continue;
+            const declaration = statement.declarationList.declarations[0];
+            if (declaration && declaration.name.kind === SyntaxKind.Identifier && idText(declaration.name) === modelName && declaration.initializer && isEffectSchemaStructInitializer(declaration.initializer)) {
+                return declaration;
+            }
+        }
+        return undefined;
+    }
+
+    // Serialize a property of the source struct value's type (Encoded / Type / ~type.make.in
+    // / DecodingServices / ...). The resolver reads the property off the const's initializer
+    // type and serializes the resolved type, so `never` stays `never` and nothing synthesizes
+    // `S.Struct.*` references that could fail to resolve in the source file's scope.
+    function materializeEffectSchemaStructProperty(modelName: string, propertyName: string): TypeNode | undefined {
+        const declaration = getEffectSchemaSourceStructDeclaration(modelName);
+        if (!declaration) return undefined;
+        return resolver.createTypeOfStructSchemaProperty(declaration, propertyName, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+    }
+
+    function canCreateEffectSchemaGeneratedStructNamespace(modelName: string): boolean {
+        return !!materializeEffectSchemaStructProperty(modelName, "Encoded");
+    }
+
+    // An `Encoded` / `Make` namespace member — an interface when the property is an object
+    // literal, otherwise a type alias (mirrors createEffectSchemaEncodedDeclaration).
+    function createEffectSchemaStructInterfaceFromProperty(modelName: string, propertyName: string, declaredName: string): Statement | undefined {
+        const type = materializeEffectSchemaStructProperty(modelName, propertyName);
+        if (!type) return;
+        if (isTypeLiteralNode(type)) {
+            return factory.createInterfaceDeclaration(/*modifiers*/ undefined, factory.createIdentifier(declaredName), /*typeParameters*/ undefined, /*heritageClauses*/ undefined, type.members);
+        }
+        return factory.createTypeAliasDeclaration(/*modifiers*/ undefined, factory.createIdentifier(declaredName), /*typeParameters*/ undefined, type);
+    }
+
+    function createEffectSchemaStructServiceDeclaration(modelName: string, name: "DecodingServices" | "EncodingServices"): TypeAliasDeclaration {
+        const resolved = materializeEffectSchemaStructProperty(modelName, name);
+        const serviceType = !resolved || resolved.kind === SyntaxKind.AnyKeyword ? factory.createKeywordTypeNode(SyntaxKind.NeverKeyword) : resolved;
+        return factory.createTypeAliasDeclaration(/*modifiers*/ undefined, factory.createIdentifier(name), /*typeParameters*/ undefined, serviceType);
+    }
+
+    function structHasExportModifier(statement: VariableStatement): boolean {
+        return !!statement.modifiers && some(statement.modifiers, modifier => modifier.kind === SyntaxKind.ExportKeyword);
+    }
+
+    function effectSchemaStructModifiers(exported: boolean, includeDeclare: boolean): Modifier[] | undefined {
+        const modifiers: Modifier[] = [];
+        if (exported) modifiers.push(factory.createModifier(SyntaxKind.ExportKeyword));
+        if (includeDeclare) modifiers.push(factory.createModifier(SyntaxKind.DeclareKeyword));
+        return modifiers.length ? modifiers : undefined;
+    }
+
+    // `import("#lib/StructFacade").StructFacade<X, X.Encoded, X.Make, X.DecodingServices,
+    // X.EncodingServices, X.Fields>` — a self-contained import type (no import statement to
+    // inject), resolved cross-package via the api package's `#lib/*` subpath import. The
+    // scanner-local facade extends `S.Struct<Fields>`, so the value stays Workflow-compatible.
+    function createEffectSchemaStructFacadeType(modelName: string): TypeNode {
+        const member = (name: string) => factory.createTypeReferenceNode(factory.createQualifiedName(factory.createIdentifier(modelName), factory.createIdentifier(name)));
+        return factory.createImportTypeNode(
+            factory.createLiteralTypeNode(factory.createStringLiteral("#lib/StructFacade")),
+            /*attributes*/ undefined,
+            factory.createIdentifier("StructFacade"),
+            [
+                factory.createTypeReferenceNode(factory.createIdentifier(modelName)),
+                member("Encoded"),
+                member("Make"),
+                member("DecodingServices"),
+                member("EncodingServices"),
+                member("Fields"),
+            ],
+            /*isTypeOf*/ false,
+        );
+    }
+
+    function createEffectSchemaGeneratedStructNamespace(modelName: string, exported: boolean): ModuleDeclaration | undefined {
+        const fields = createEffectSchemaStructInterfaceFromProperty(modelName, "fields", "Fields");
+        if (!fields) return;
+        const encoded = createEffectSchemaStructInterfaceFromProperty(modelName, "Encoded", "Encoded");
+        if (!encoded) return;
+        const make = createEffectSchemaStructInterfaceFromProperty(modelName, "~type.make.in", "Make");
+        const members: Statement[] = [fields, encoded];
+        if (make) members.push(make);
+        members.push(createEffectSchemaStructServiceDeclaration(modelName, "DecodingServices"));
+        members.push(createEffectSchemaStructServiceDeclaration(modelName, "EncodingServices"));
+        return factory.createModuleDeclaration(
+            effectSchemaStructModifiers(exported, /*includeDeclare*/ true),
+            factory.createIdentifier(modelName),
+            factory.createModuleBlock(factory.createNodeArray(members)),
+            NodeFlags.Namespace,
+        );
+    }
+
+    // A `const X = S.Struct(...)` stays a CONST (it is a value, not a class). Its giant
+    // `S.Struct<{...}>` annotation is replaced by the compact facade, and the named member
+    // types are attached via a sibling `interface X` (decoded `Self`) plus a TYPE-ONLY
+    // `declare namespace X` (Encoded/Make/services) — both type-space, so they merge with the
+    // const without a value collision:
+    //   declare const X: S.OpaqueFacade<X, X.Encoded, X.Make, X.DecodingServices, X.EncodingServices, {}>;
+    //   interface X { ...decoded Type... }
+    //   declare namespace X { Encoded; Make; DecodingServices; EncodingServices }
+    // The source's `export type X = typeof X.Type` companion (if any) is dropped — the
+    // `interface X` replaces it.
+    function createEffectSchemaStructDeclarations(statement: VariableStatement, modelName: string): Statement[] | undefined {
+        const typeNode = materializeEffectSchemaStructProperty(modelName, "Type");
+        if (!typeNode || !isTypeLiteralNode(typeNode)) return;
+        const namespace = createEffectSchemaGeneratedStructNamespace(modelName, structHasExportModifier(statement));
+        if (!namespace) return;
+        const exported = structHasExportModifier(statement);
+        const declaration = statement.declarationList.declarations[0];
+        if (!declaration || declaration.name.kind !== SyntaxKind.Identifier) return;
+
+        // The facade extends `S.Struct<X.Fields>`, so `.fields` and Struct-shape are
+        // preserved (Workflow/Union/`.fields.x` keep working) while Type/Encoded/services
+        // resolve to the named namespace interfaces.
+        const retypedConst = factory.updateVariableStatement(
+            statement,
+            statement.modifiers,
+            factory.updateVariableDeclarationList(statement.declarationList, [
+                factory.updateVariableDeclaration(
+                    declaration,
+                    declaration.name,
+                    declaration.exclamationToken,
+                    createEffectSchemaStructFacadeType(modelName),
+                    declaration.initializer,
+                ),
+            ]),
+        );
+
+        const typeInterface = factory.createInterfaceDeclaration(
+            effectSchemaStructModifiers(exported, /*includeDeclare*/ false),
+            factory.createIdentifier(modelName),
+            /*typeParameters*/ undefined,
+            /*heritageClauses*/ undefined,
+            typeNode.members,
+        );
+
+        return [retypedConst, typeInterface, namespace];
+    }
+
+    // The source's `export type X = ...` companion of a faceted struct — dropped in favour of
+    // the generated `interface X`.
+    function isEffectSchemaStructCompanionTypeAlias(statement: Statement, structModelNames: Set<string>): boolean {
+        return isTypeAliasDeclaration(statement) && structModelNames.has(idText(statement.name));
     }
 
     function getEffectSchemaBaseModelName(statement: Statement): string | undefined {

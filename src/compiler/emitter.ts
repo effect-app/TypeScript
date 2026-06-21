@@ -1167,6 +1167,7 @@ export const notImplementedResolver: EmitResolver = {
     createTypeOfExpression: notImplemented,
     createTypeOfTypeNode: notImplemented,
     createTypeLiteralOfTypeNode: notImplemented,
+    createTypeOfStructSchemaProperty: notImplemented,
     createTypeLiteralOfClassDeclaration: notImplemented,
     createMakeTypeOfClassDeclaration: notImplemented,
     createTypeOfClassStaticProperty: notImplemented,

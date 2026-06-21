@@ -51264,9 +51264,26 @@ export function createTypeChecker(host: TypeCheckerHost): TypeChecker {
     function getTypeOfClassSchemaProperty(declaration: ClassDeclaration, propertyName: string) {
         const schemaExpression = getClassSchemaExpression(declaration);
         if (!schemaExpression) return;
+        return getTypeOfSchemaExpressionProperty(schemaExpression, propertyName);
+    }
+
+    function getTypeOfSchemaExpressionProperty(schemaExpression: Expression, propertyName: string) {
         const schemaType = getTypeOfExpression(schemaExpression);
         const property = getPropertyOfType(schemaType, escapeLeadingUnderscores(propertyName));
         return property && getTypeOfSymbolAtLocation(property, schemaExpression);
+    }
+
+    // Like createTypeOfClassStaticProperty, but for a `const X = S.Struct(...)` schema value:
+    // reads `propertyName` (Encoded / Type / ~type.make.in / DecodingServices / ...) off the
+    // type of the const's initializer and serializes it. Serializing the resolved type keeps
+    // `never` as `never` and never synthesizes `S.Struct.*` references that could fail to
+    // resolve in the source file's scope.
+    function createTypeOfStructSchemaProperty(declarationIn: VariableDeclaration, propertyName: string, enclosingDeclaration: Node, flags: NodeBuilderFlags, internalFlags: InternalNodeBuilderFlags, tracker: SymbolTracker) {
+        const declaration = getParseTreeNode(declarationIn, isVariableDeclaration) || declarationIn;
+        if (!declaration || !declaration.initializer) return;
+        const propertyType = getTypeOfSchemaExpressionProperty(declaration.initializer, propertyName);
+        if (!propertyType) return;
+        return nodeBuilder.typeToTypeNode(propertyType, enclosingDeclaration, flags | NodeBuilderFlags.MultilineObjectLiterals | NodeBuilderFlags.UseFullyQualifiedType, internalFlags, tracker);
     }
 
     function getClassSchemaExpression(declaration: ClassDeclaration): Expression | undefined {
@@ -51520,6 +51537,7 @@ export function createTypeChecker(host: TypeCheckerHost): TypeChecker {
             createTypeOfExpression,
             createTypeOfTypeNode,
             createTypeLiteralOfTypeNode,
+            createTypeOfStructSchemaProperty,
             createTypeLiteralOfClassDeclaration,
             createMakeTypeOfClassDeclaration,
             createTypeOfClassStaticProperty,
