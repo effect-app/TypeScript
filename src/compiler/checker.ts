@@ -51218,6 +51218,116 @@ export function createTypeChecker(host: TypeCheckerHost): TypeChecker {
         return nodeBuilder.serializeTypeForExpression(expr, enclosingDeclaration, flags | NodeBuilderFlags.MultilineObjectLiterals, internalFlags, tracker);
     }
 
+    function createTypeOfTypeNode(typeNodeIn: TypeNode, enclosingDeclaration: Node, flags: NodeBuilderFlags, internalFlags: InternalNodeBuilderFlags, tracker: SymbolTracker) {
+        const typeNode = getParseTreeNode(typeNodeIn, isTypeNode) || typeNodeIn;
+        if (!typeNode) {
+            return factory.createToken(SyntaxKind.AnyKeyword) as KeywordTypeNode;
+        }
+        return nodeBuilder.typeToTypeNode(getTypeFromTypeNode(typeNode), enclosingDeclaration, flags | NodeBuilderFlags.MultilineObjectLiterals, internalFlags, tracker);
+    }
+
+    function createTypeLiteralOfTypeNode(typeNodeIn: TypeNode, enclosingDeclaration: Node, flags: NodeBuilderFlags, internalFlags: InternalNodeBuilderFlags, tracker: SymbolTracker) {
+        const typeNode = getParseTreeNode(typeNodeIn, isTypeNode) || typeNodeIn;
+        if (!typeNode) return;
+        return createTypeLiteralOfType(getTypeFromTypeNode(typeNode), enclosingDeclaration, flags, internalFlags, tracker);
+    }
+
+    function createTypeLiteralOfClassDeclaration(declarationIn: ClassDeclaration, enclosingDeclaration: Node, flags: NodeBuilderFlags, internalFlags: InternalNodeBuilderFlags, tracker: SymbolTracker) {
+        const declaration = getParseTreeNode(declarationIn, isClassDeclaration) || declarationIn;
+        if (!declaration) return;
+        const schemaType = getTypeOfClassSchemaProperty(declaration, "Type");
+        if (schemaType) {
+            return createTypeLiteralOfType(schemaType, enclosingDeclaration, flags, internalFlags, tracker);
+        }
+        const symbol = getSymbolOfDeclaration(declaration);
+        if (!symbol) return;
+        return createTypeLiteralOfType(getDeclaredTypeOfSymbol(symbol), enclosingDeclaration, flags, internalFlags, tracker);
+    }
+
+    function createMakeTypeOfClassDeclaration(declarationIn: ClassDeclaration, enclosingDeclaration: Node, flags: NodeBuilderFlags, internalFlags: InternalNodeBuilderFlags, tracker: SymbolTracker) {
+        const declaration = getParseTreeNode(declarationIn, isClassDeclaration) || declarationIn;
+        if (!declaration) return;
+        const makeType = getTypeOfClassSchemaProperty(declaration, "~type.make.in");
+        const typeType = getTypeOfClassSchemaProperty(declaration, "Type");
+        if (!makeType || !typeType) return;
+        return createMakeTypeOfTypes(makeType, typeType, enclosingDeclaration, flags, internalFlags, tracker);
+    }
+
+    function createTypeOfClassStaticProperty(declarationIn: ClassDeclaration, propertyName: string, enclosingDeclaration: Node, flags: NodeBuilderFlags, internalFlags: InternalNodeBuilderFlags, tracker: SymbolTracker) {
+        const declaration = getParseTreeNode(declarationIn, isClassDeclaration) || declarationIn;
+        if (!declaration) return;
+        const propertyType = getTypeOfClassSchemaProperty(declaration, propertyName) || getTypeOfClassStaticProperty(declaration, propertyName);
+        if (!propertyType) return;
+        return nodeBuilder.typeToTypeNode(propertyType, enclosingDeclaration, flags | NodeBuilderFlags.MultilineObjectLiterals | NodeBuilderFlags.UseFullyQualifiedType, internalFlags, tracker);
+    }
+
+    function getTypeOfClassSchemaProperty(declaration: ClassDeclaration, propertyName: string) {
+        const schemaExpression = getClassSchemaExpression(declaration);
+        if (!schemaExpression) return;
+        const schemaType = getTypeOfExpression(schemaExpression);
+        const property = getPropertyOfType(schemaType, escapeLeadingUnderscores(propertyName));
+        return property && getTypeOfSymbolAtLocation(property, schemaExpression);
+    }
+
+    function getClassSchemaExpression(declaration: ClassDeclaration): Expression | undefined {
+        const heritageClause = declaration.heritageClauses?.[0];
+        const heritageType = heritageClause?.types[0];
+        const expression = heritageType?.expression;
+        return expression && isCallExpression(expression) && expression.arguments.length > 0 ? expression.arguments[0] : undefined;
+    }
+
+    function getTypeOfClassStaticProperty(declaration: ClassDeclaration, propertyName: string) {
+        const symbol = getSymbolOfDeclaration(declaration);
+        if (!symbol) return;
+        const staticType = getTypeOfSymbol(symbol);
+        const property = getPropertyOfType(staticType, escapeLeadingUnderscores(propertyName));
+        return property && getTypeOfSymbolAtLocation(property, declaration);
+    }
+
+    function createTypeLiteralOfType(type: Type, enclosingDeclaration: Node, flags: NodeBuilderFlags, internalFlags: InternalNodeBuilderFlags, tracker: SymbolTracker) {
+        const members = map(getPropertiesOfType(type), property => {
+            const name = unescapeLeadingUnderscores(property.escapedName);
+            const propertyType = getTypeOfSymbol(property);
+            const propertyTypeNode = nodeBuilder.typeToTypeNode(propertyType, enclosingDeclaration, flags | NodeBuilderFlags.MultilineObjectLiterals | NodeBuilderFlags.UseFullyQualifiedType, internalFlags, tracker)
+                || factory.createKeywordTypeNode(SyntaxKind.AnyKeyword);
+            return factory.createPropertySignature(
+                [factory.createModifier(SyntaxKind.ReadonlyKeyword)],
+                isIdentifierText(name, ScriptTarget.ESNext) ? factory.createIdentifier(name) : factory.createStringLiteral(name),
+                property.flags & SymbolFlags.Optional ? factory.createToken(SyntaxKind.QuestionToken) : undefined,
+                propertyTypeNode,
+            );
+        });
+        return factory.createTypeLiteralNode(members);
+    }
+
+    function createMakeTypeOfTypes(makeType: Type, typeType: Type, enclosingDeclaration: Node, flags: NodeBuilderFlags, internalFlags: InternalNodeBuilderFlags, tracker: SymbolTracker) {
+        const isVoidish = (type: Type) => !!(type.flags & (TypeFlags.Void | TypeFlags.Undefined));
+        const makeTypes = makeType.flags & TypeFlags.Union ? (makeType as UnionType).types : undefined;
+        const hasVoid = !!makeTypes?.some(isVoidish);
+        const objectMakeType = makeTypes
+            ? makeTypes.find(type => getPropertiesOfType(type).length > 0) || makeType
+            : makeType;
+        const makeProperties = getPropertiesOfType(objectMakeType);
+        if (!makeProperties.length) {
+            return nodeBuilder.typeToTypeNode(makeType, enclosingDeclaration, flags | NodeBuilderFlags.MultilineObjectLiterals | NodeBuilderFlags.UseFullyQualifiedType, internalFlags, tracker);
+        }
+        const typeProperties = new Map(getPropertiesOfType(typeType).map(property => [property.escapedName, property]));
+        const literal = factory.createTypeLiteralNode(map(makeProperties, property => {
+            const name = unescapeLeadingUnderscores(property.escapedName);
+            const source = typeProperties.get(property.escapedName) || property;
+            const propertyType = getTypeOfSymbol(source);
+            const propertyTypeNode = nodeBuilder.typeToTypeNode(propertyType, enclosingDeclaration, flags | NodeBuilderFlags.MultilineObjectLiterals | NodeBuilderFlags.UseFullyQualifiedType, internalFlags, tracker)
+                || factory.createKeywordTypeNode(SyntaxKind.AnyKeyword);
+            return factory.createPropertySignature(
+                [factory.createModifier(SyntaxKind.ReadonlyKeyword)],
+                isIdentifierText(name, ScriptTarget.ESNext) ? factory.createIdentifier(name) : factory.createStringLiteral(name),
+                property.flags & SymbolFlags.Optional ? factory.createToken(SyntaxKind.QuestionToken) : undefined,
+                propertyTypeNode,
+            );
+        }));
+        return hasVoid ? factory.createUnionTypeNode([literal, factory.createKeywordTypeNode(SyntaxKind.VoidKeyword)]) : literal;
+    }
+
     function hasGlobalName(name: string): boolean {
         return globals.has(escapeLeadingUnderscores(name));
     }
@@ -51408,6 +51518,11 @@ export function createTypeChecker(host: TypeCheckerHost): TypeChecker {
             createTypeOfDeclaration,
             createReturnTypeOfSignatureDeclaration,
             createTypeOfExpression,
+            createTypeOfTypeNode,
+            createTypeLiteralOfTypeNode,
+            createTypeLiteralOfClassDeclaration,
+            createMakeTypeOfClassDeclaration,
+            createTypeOfClassStaticProperty,
             createLiteralConstValue,
             isSymbolAccessible,
             isEntityNameVisible,

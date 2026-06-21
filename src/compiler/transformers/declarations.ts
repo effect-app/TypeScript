@@ -37,6 +37,7 @@ import {
     EmitResolver,
     emptyArray,
     EntityNameOrEntityNameExpression,
+    EntityName,
     EnumDeclaration,
     ExportAssignment,
     ExportDeclaration,
@@ -81,11 +82,13 @@ import {
     hasSyntacticModifier,
     HeritageClause,
     Identifier,
+    idText,
     ImportAttributes,
     ImportDeclaration,
     ImportEqualsDeclaration,
     ImportTypeNode,
     IndexSignatureDeclaration,
+    IntersectionTypeNode,
     InterfaceDeclaration,
     InternalNodeBuilderFlags,
     isAmbientModule,
@@ -128,6 +131,7 @@ import {
     isObjectLiteralExpression,
     isOmittedExpression,
     isParameter,
+    isPropertyAccessExpression,
     isPrimitiveLiteralValue,
     isPrivateIdentifier,
     isSemicolonClassElement,
@@ -178,6 +182,7 @@ import {
     PropertyDeclaration,
     PropertySignature,
     pushIfUnique,
+    QualifiedName,
     removeAllComments,
     ScriptTarget,
     SetAccessorDeclaration,
@@ -185,6 +190,7 @@ import {
     setEmitFlags,
     setOriginalNode,
     setParent,
+    setParentRecursive,
     setTextRange,
     SignatureDeclaration,
     some,
@@ -202,8 +208,10 @@ import {
     transformNodes,
     tryCast,
     TypeAliasDeclaration,
+    TypeElement,
     TypeNode,
     TypeParameterDeclaration,
+    TypeQueryNode,
     TypeReferenceNode,
     unescapeLeadingUnderscores,
     unwrapParenthesizedExpression,
@@ -533,6 +541,7 @@ export function transformDeclarations(context: TransformationContext): Transform
         else {
             const statements = visitNodes(node.statements, visitDeclarationStatements, isStatement);
             combinedStatements = setTextRange(factory.createNodeArray(transformAndReplaceLatePaintedStatements(statements)), node.statements);
+            combinedStatements = setTextRange(factory.createNodeArray(createEffectSchemaSourceFileDeclarations(combinedStatements)), combinedStatements);
             if (isExternalModule(node) && (!resultHasExternalModuleIndicator || (needsScopeFixMarker && !resultHasScopeMarker))) {
                 combinedStatements = setTextRange(factory.createNodeArray([...combinedStatements, createEmptyExports(factory)]), combinedStatements);
             }
@@ -1561,18 +1570,23 @@ export function transformDeclarations(context: TransformationContext): Transform
                             lateStatements = visitNodes(lateStatements, stripExportModifiers, isStatement);
                         }
                     }
+                    const schemaModelDeclarations = createEffectSchemaModelDeclarations(input, lateStatements);
+                    if (schemaModelDeclarations) {
+                        lateStatements = factory.createNodeArray(schemaModelDeclarations.namespaceStatements);
+                    }
                     const body = factory.updateModuleBlock(inner, lateStatements);
                     needsDeclare = previousNeedsDeclare;
                     needsScopeFixMarker = oldNeedsScopeFix;
                     resultHasScopeMarker = oldHasScopeFix;
                     const mods = ensureModifiers(input);
 
-                    return cleanup(updateModuleDeclarationAndKeyword(
+                    const updated = cleanup(updateModuleDeclarationAndKeyword(
                         input,
                         mods,
                         isExternalModuleAugmentation(input) ? rewriteModuleSpecifier(input, input.name) : input.name,
                         body,
                     ));
+                    return schemaModelDeclarations?.typeInterface && updated ? [schemaModelDeclarations.typeInterface, updated] : updated;
                 }
                 else {
                     needsDeclare = previousNeedsDeclare;
@@ -1859,6 +1873,592 @@ export function transformDeclarations(context: TransformationContext): Transform
                 )),
             clause => clause.types && !!clause.types.length,
         ));
+    }
+
+    function createEffectSchemaModelDeclarations(input: ModuleDeclaration, statements: NodeArray<Statement>) {
+        if (input.name.kind !== SyntaxKind.Identifier) return;
+        const encoded = statements.find(isEffectSchemaStructNestedEncodedInterface);
+        if (!encoded) return;
+
+        const encodedLiteral = materializeSchemaNestedEncoded(encoded);
+
+        let changed = false;
+        const namespaceStatements: Statement[] = [...flatMap(statements, statement => {
+            if (statement === encoded && encodedLiteral) {
+                changed = true;
+                const next: Statement[] = [factory.createInterfaceDeclaration(
+                    encoded.modifiers,
+                    encoded.name,
+                    encoded.typeParameters,
+                    /*heritageClauses*/ undefined,
+                    encodedLiteral.members,
+                )];
+                return next;
+            }
+            return [statement];
+        })];
+
+        return changed ? { typeInterface: undefined, namespaceStatements } : undefined;
+    }
+
+    function isEffectSchemaStructNestedEncodedInterface(statement: Statement): statement is InterfaceDeclaration {
+        if (!isInterfaceDeclaration(statement) || idText(statement.name) !== "Encoded") return false;
+        const clause = statement.heritageClauses?.[0];
+        const heritageType = clause?.types[0];
+        if (!heritageType || clause!.types.length !== 1 || heritageType.typeArguments?.length !== 1) return false;
+        const expression = heritageType.expression;
+        return isPropertyAccessExpression(expression)
+            && idText(expression.name) === "StructNestedEncoded"
+            && heritageType.typeArguments[0].kind === SyntaxKind.TypeQuery;
+    }
+
+    function materializeSchemaNestedEncoded(encoded: InterfaceDeclaration) {
+        const heritageType = encoded.heritageClauses![0].types[0];
+        const typeName = expressionToEntityName(heritageType.expression);
+        if (!typeName) return;
+        const typeNode = factory.createTypeReferenceNode(typeName, heritageType.typeArguments);
+        setParent(typeNode, encoded);
+        return resolver.createTypeLiteralOfTypeNode(typeNode, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+    }
+
+    function createEffectSchemaSourceFileDeclarations(statements: NodeArray<Statement>): Statement[] {
+        const modelNames = new Set<string>();
+        const existingNamespaceNames = new Set<string>();
+        const classes = new Map<string, ClassDeclaration>();
+        const schemaClasses = getEffectSchemaOriginalClasses();
+        for (const statement of statements) {
+            const className = getEffectSchemaClassName(statement);
+            if (className && isClassDeclaration(statement)) {
+                classes.set(className, statement);
+            }
+        }
+        for (const statement of statements) {
+            if ((isEffectSchemaModelNamespace(statement) || isEffectSchemaMaterializedModelNamespace(statement, classes)) && schemaClasses.has(idText(statement.name))) {
+                modelNames.add(idText(statement.name));
+                existingNamespaceNames.add(idText(statement.name));
+            }
+        }
+        const requestBaseInfos = new Map<string, EffectSchemaRequestBaseInfo>();
+        for (const statement of statements) {
+            const info = getEffectSchemaRequestBaseInfo(statement);
+            if (info && classes.has(info.modelName) && !schemaClasses.has(info.modelName)) {
+                requestBaseInfos.set(info.modelName, info);
+            }
+        }
+        for (const [className, classDeclaration] of schemaClasses) {
+            if (!existingNamespaceNames.has(className) && canCreateEffectSchemaGeneratedNamespace(classDeclaration)) {
+                modelNames.add(className);
+            }
+        }
+        if (!modelNames.size && !requestBaseInfos.size) return [...statements];
+
+        let changed = false;
+        const next: Statement[] = [];
+        for (const statement of statements) {
+            const baseModelName = getEffectSchemaBaseModelName(statement);
+            if (baseModelName && modelNames.has(baseModelName)) {
+                const classDeclaration = schemaClasses.get(baseModelName) || classes.get(baseModelName);
+                const updated = classDeclaration && updateEffectSchemaBaseDeclaration(
+                    statement,
+                    baseModelName,
+                    classDeclaration,
+                    needsEffectSchemaIntermediateClass(classDeclaration),
+                );
+                if (updated) {
+                    changed = true;
+                    next.push(updated);
+                    continue;
+                }
+            }
+            const requestBaseInfo = baseModelName && requestBaseInfos.get(baseModelName);
+            if (requestBaseInfo) {
+                const updated = updateEffectSchemaRequestBaseDeclaration(statement, requestBaseInfo);
+                if (updated) {
+                    changed = true;
+                    next.push(updated);
+                    continue;
+                }
+            }
+            if (isEffectSchemaModelNamespace(statement)) {
+                const classDeclaration = schemaClasses.get(idText(statement.name)) || classes.get(idText(statement.name));
+                const updated = classDeclaration && updateEffectSchemaNamespaceDeclaration(statement, classDeclaration);
+                if (updated) {
+                    changed = true;
+                    next.push(updated);
+                    continue;
+                }
+            }
+            if (isEffectSchemaMaterializedModelNamespace(statement, classes)) {
+                const classDeclaration = schemaClasses.get(idText(statement.name)) || classes.get(idText(statement.name));
+                const updated = classDeclaration && updateEffectSchemaNamespaceDeclaration(statement, classDeclaration);
+                if (updated) {
+                    changed = true;
+                    next.push(updated);
+                    continue;
+                }
+            }
+            const className = getEffectSchemaClassName(statement);
+            const requestInfo = className && requestBaseInfos.get(className);
+            if (requestInfo) {
+                const classDeclaration = statement as ClassDeclaration;
+                const typeInterface = !hasTopLevelInterface(statements, className)
+                    ? createEffectSchemaTypeInterface(classDeclaration)
+                    : undefined;
+                const namespace = !hasTopLevelNamespace(statements, className)
+                    ? createEffectSchemaGeneratedNamespaceDeclaration(className, classDeclaration)
+                    : undefined;
+                if (typeInterface || namespace) {
+                    changed = true;
+                    next.push(statement);
+                    if (typeInterface) next.push(typeInterface);
+                    if (namespace) next.push(namespace);
+                    continue;
+                }
+            }
+            if (className && modelNames.has(className)) {
+                const classDeclaration = schemaClasses.get(className) || statement as ClassDeclaration;
+                const usesIntermediateClass = needsEffectSchemaIntermediateClass(classDeclaration);
+                const updatedClass = usesIntermediateClass
+                    ? updateEffectSchemaClassDeclaration(statement as ClassDeclaration, className)
+                    : statement;
+                const typeInterface = !hasTopLevelInterface(statements, className)
+                    ? createEffectSchemaTypeInterface(classDeclaration)
+                    : undefined;
+                const namespace = !existingNamespaceNames.has(className)
+                    ? createEffectSchemaGeneratedNamespaceDeclaration(className, classDeclaration)
+                    : undefined;
+                if (updatedClass !== statement || typeInterface || namespace) {
+                    changed = true;
+                    if (usesIntermediateClass) {
+                        next.push(createEffectSchemaIntermediateClass(className));
+                    }
+                    next.push(updatedClass);
+                    if (typeInterface) next.push(typeInterface);
+                    if (namespace) {
+                        existingNamespaceNames.add(className);
+                        next.push(namespace);
+                    }
+                    continue;
+                }
+            }
+            next.push(statement);
+        }
+        return changed ? next : [...statements];
+    }
+
+    function getEffectSchemaOriginalClasses() {
+        const classes = new Map<string, ClassDeclaration>();
+        for (const statement of currentSourceFile.statements) {
+            if (isClassDeclaration(statement) && statement.name && hasEffectSchemaOpaqueHeritage(statement)) {
+                classes.set(idText(statement.name), statement);
+            }
+        }
+        return classes;
+    }
+
+    function hasEffectSchemaOpaqueHeritage(classDeclaration: ClassDeclaration) {
+        const heritageType = classDeclaration.heritageClauses?.[0]?.types[0];
+        let expression: Node | undefined = heritageType?.expression;
+        if (!expression) return false;
+        if (expression.kind === SyntaxKind.CallExpression) {
+            expression = (expression as unknown as { expression: Node }).expression;
+        }
+        if (expression.kind === SyntaxKind.CallExpression) {
+            expression = (expression as unknown as { expression: Node }).expression;
+        }
+        return isEffectSchemaOpaqueExpression(expression);
+    }
+
+    function isEffectSchemaOpaqueExpression(expression: Node) {
+        return isPropertyAccessExpression(expression)
+            && (idText(expression.name) === "Opaque" || idText(expression.name) === "OpaqueFacade")
+            && expression.expression.kind === SyntaxKind.Identifier
+            && (idText(expression.expression as Identifier) === "S" || idText(expression.expression as Identifier) === "Schema");
+    }
+
+    function isEffectSchemaModelNamespace(statement: Statement): statement is ModuleDeclaration & { name: Identifier } {
+        if (!isModuleDeclaration(statement) || statement.name.kind !== SyntaxKind.Identifier) return false;
+        const body = statement.body;
+        // Only transform plain `StructNestedEncoded` struct models. Skip edge cases
+        // (ExtendedSchema, unions, `type Encoded = Codec.Encoded<...>` aliases) which the
+        // class-base/Type-interface rewrite cannot reconstruct soundly.
+        return !!body && body.kind === SyntaxKind.ModuleBlock && some(body.statements, isEffectSchemaStructNestedEncodedInterface);
+    }
+
+    function isEffectSchemaMaterializedModelNamespace(statement: Statement, classes: Map<string, ClassDeclaration>): statement is ModuleDeclaration & { name: Identifier } {
+        if (!isModuleDeclaration(statement) || statement.name.kind !== SyntaxKind.Identifier || !classes.has(idText(statement.name))) return false;
+        const body = statement.body;
+        return !!body && body.kind === SyntaxKind.ModuleBlock && some(body.statements, isEffectSchemaEncodedInterface);
+    }
+
+    function isEffectSchemaEncodedInterface(statement: Statement): statement is InterfaceDeclaration {
+        return isInterfaceDeclaration(statement) && idText(statement.name) === "Encoded";
+    }
+
+    function canCreateEffectSchemaGeneratedNamespace(classDeclaration: ClassDeclaration) {
+        return !!createEffectSchemaEncodedDeclaration(classDeclaration);
+    }
+
+    function getEffectSchemaClassName(statement: Statement): string | undefined {
+        return isClassDeclaration(statement) && statement.name ? idText(statement.name) : undefined;
+    }
+
+    function hasTopLevelInterface(statements: NodeArray<Statement>, name: string): boolean {
+        return some(statements, statement => isInterfaceDeclaration(statement) && idText(statement.name) === name);
+    }
+
+    function hasTopLevelNamespace(statements: NodeArray<Statement>, name: string): boolean {
+        return some(statements, statement => isModuleDeclaration(statement) && statement.name.kind === SyntaxKind.Identifier && idText(statement.name) === name);
+    }
+
+    function createEffectSchemaTypeInterface(classDeclaration: ClassDeclaration) {
+        if (!classDeclaration.name) return;
+        const literal = resolver.createTypeLiteralOfClassDeclaration(classDeclaration, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        return literal && factory.createInterfaceDeclaration(
+            createEffectSchemaNamespaceModifiers(classDeclaration, /*includeDeclare*/ false),
+            classDeclaration.name,
+            /*typeParameters*/ undefined,
+            /*heritageClauses*/ undefined,
+            literal.members,
+        );
+    }
+
+    function updateEffectSchemaNamespaceDeclaration(namespace: ModuleDeclaration & { name: Identifier }, classDeclaration: ClassDeclaration) {
+        const body = namespace.body;
+        if (!body || body.kind !== SyntaxKind.ModuleBlock) return;
+        const existing = new Set<string>();
+        const kept: Statement[] = [];
+        for (const statement of body.statements) {
+            if ((isInterfaceDeclaration(statement) || isTypeAliasDeclaration(statement)) && idText(statement.name) !== "Encoded") {
+                existing.add(idText(statement.name));
+                if (idText(statement.name) === "Make" || idText(statement.name) === "DecodingServices" || idText(statement.name) === "EncodingServices") {
+                    continue;
+                }
+            }
+            kept.push(statement);
+        }
+        const makeDeclaration = createEffectSchemaMakeDeclaration(classDeclaration);
+        const decodingServices = createEffectSchemaServiceDeclaration(classDeclaration, "DecodingServices");
+        const encodingServices = createEffectSchemaServiceDeclaration(classDeclaration, "EncodingServices");
+        const additions: Statement[] = [];
+        if (makeDeclaration) additions.push(makeDeclaration);
+        if (decodingServices) additions.push(decodingServices);
+        if (encodingServices) additions.push(encodingServices);
+        if (!additions.length && existing.size === 0) return;
+        return factory.updateModuleDeclaration(
+            namespace,
+            namespace.modifiers,
+            namespace.name,
+            factory.updateModuleBlock(body, factory.createNodeArray([...kept, ...additions])),
+        );
+    }
+
+    function createEffectSchemaGeneratedNamespaceDeclaration(modelName: string, classDeclaration: ClassDeclaration) {
+        const encodedDeclaration = createEffectSchemaEncodedDeclaration(classDeclaration);
+        if (!encodedDeclaration) return;
+        const makeDeclaration = createEffectSchemaMakeDeclaration(classDeclaration);
+        const decodingServices = createEffectSchemaServiceDeclaration(classDeclaration, "DecodingServices");
+        const encodingServices = createEffectSchemaServiceDeclaration(classDeclaration, "EncodingServices");
+        return factory.createModuleDeclaration(
+            createEffectSchemaNamespaceModifiers(classDeclaration, /*includeDeclare*/ true),
+            factory.createIdentifier(modelName),
+            factory.createModuleBlock(factory.createNodeArray([
+                encodedDeclaration,
+                ...(makeDeclaration ? [makeDeclaration] : []),
+                ...(decodingServices ? [decodingServices] : []),
+                ...(encodingServices ? [encodingServices] : []),
+            ])),
+            NodeFlags.Namespace,
+        );
+    }
+
+    function createEffectSchemaNamespaceModifiers(classDeclaration: ClassDeclaration, includeDeclare: boolean) {
+        const modifiers: Modifier[] = [];
+        if (hasEffectSchemaSyntacticModifier(classDeclaration, SyntaxKind.ExportKeyword)) {
+            modifiers.push(factory.createModifier(SyntaxKind.ExportKeyword));
+        }
+        if (includeDeclare) {
+            modifiers.push(factory.createModifier(SyntaxKind.DeclareKeyword));
+        }
+        return modifiers.length ? modifiers : undefined;
+    }
+
+    function hasEffectSchemaSyntacticModifier(node: ClassDeclaration, kind: SyntaxKind) {
+        return !!node.modifiers && some(node.modifiers, modifier => modifier.kind === kind);
+    }
+
+    function createEffectSchemaEncodedDeclaration(classDeclaration: ClassDeclaration) {
+        const encodedType = resolver.createTypeOfClassStaticProperty(classDeclaration, "Encoded", enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        if (!encodedType) return;
+        if (isTypeLiteralNode(encodedType)) {
+            return factory.createInterfaceDeclaration(
+                /*modifiers*/ undefined,
+                factory.createIdentifier("Encoded"),
+                /*typeParameters*/ undefined,
+                /*heritageClauses*/ undefined,
+                encodedType.members,
+            );
+        }
+        return factory.createTypeAliasDeclaration(
+            /*modifiers*/ undefined,
+            factory.createIdentifier("Encoded"),
+            /*typeParameters*/ undefined,
+            encodedType,
+        );
+    }
+
+    function createEffectSchemaMakeDeclaration(classDeclaration: ClassDeclaration) {
+        const makeType = resolver.createMakeTypeOfClassDeclaration(classDeclaration, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker)
+            || resolver.createTypeOfClassStaticProperty(classDeclaration, "~type.make.in", enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        if (!makeType) return;
+        if (isTypeLiteralNode(makeType)) {
+            return factory.createInterfaceDeclaration(
+                /*modifiers*/ undefined,
+                factory.createIdentifier("Make"),
+                /*typeParameters*/ undefined,
+                /*heritageClauses*/ undefined,
+                makeType.members,
+            );
+        }
+        return factory.createTypeAliasDeclaration(
+            /*modifiers*/ undefined,
+            factory.createIdentifier("Make"),
+            /*typeParameters*/ undefined,
+            makeType,
+        );
+    }
+
+    function createEffectSchemaServiceDeclaration(classDeclaration: ClassDeclaration, name: "DecodingServices" | "EncodingServices") {
+        const resolved = resolver.createTypeOfClassStaticProperty(classDeclaration, name, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        const serviceType = resolved?.kind === SyntaxKind.AnyKeyword ? factory.createKeywordTypeNode(SyntaxKind.NeverKeyword) : resolved;
+        return serviceType && factory.createTypeAliasDeclaration(
+            /*modifiers*/ undefined,
+            factory.createIdentifier(name),
+            /*typeParameters*/ undefined,
+            serviceType,
+        );
+    }
+
+    function getEffectSchemaBaseModelName(statement: Statement): string | undefined {
+        if (statement.kind !== SyntaxKind.VariableStatement) return;
+        const variableStatement = statement as VariableStatement;
+        if (variableStatement.declarationList.declarations.length !== 1) return;
+        const declaration = variableStatement.declarationList.declarations[0];
+        if (declaration.name.kind !== SyntaxKind.Identifier) return;
+        const name = idText(declaration.name);
+        if (!name.endsWith("_base")) return undefined;
+        const baseName = name.slice(0, -"_base".length);
+        return baseName.startsWith("__") ? baseName.slice(2) : baseName;
+    }
+
+    function updateEffectSchemaBaseDeclaration(statement: Statement, modelName: string, classDeclaration: ClassDeclaration, usesIntermediateClass: boolean): VariableStatement | undefined {
+        if (statement.kind !== SyntaxKind.VariableStatement) return;
+        const variableStatement = statement as VariableStatement;
+        const declaration = variableStatement.declarationList.declarations[0];
+        if (!declaration || declaration.name.kind !== SyntaxKind.Identifier) return;
+        const updatedDeclaration = factory.updateVariableDeclaration(
+            declaration,
+            usesIntermediateClass ? factory.createIdentifier(`__${modelName}_base`) : declaration.name,
+            declaration.exclamationToken,
+            createEffectSchemaFacadeBaseType(modelName, classDeclaration),
+            declaration.initializer,
+        );
+        return factory.updateVariableStatement(
+            variableStatement,
+            variableStatement.modifiers,
+            factory.updateVariableDeclarationList(variableStatement.declarationList, [updatedDeclaration]),
+        );
+    }
+
+    interface EffectSchemaRequestBaseInfo {
+        readonly modelName: string;
+        readonly brandType: TypeNode;
+    }
+
+    function getEffectSchemaRequestBaseInfo(statement: Statement): EffectSchemaRequestBaseInfo | undefined {
+        if (statement.kind !== SyntaxKind.VariableStatement) return;
+        const variableStatement = statement as VariableStatement;
+        if (variableStatement.declarationList.declarations.length !== 1) return;
+        const declaration = variableStatement.declarationList.declarations[0];
+        if (!declaration || declaration.name.kind !== SyntaxKind.Identifier || !declaration.type) return;
+        const modelName = getEffectSchemaBaseModelName(statement);
+        if (!modelName) return;
+        const opaqueType = getEffectSchemaRequestOpaqueType(declaration.type, modelName);
+        if (!opaqueType) return;
+        const typeArguments = opaqueType.typeArguments;
+        return typeArguments && typeArguments.length >= 4
+            ? { modelName, brandType: typeArguments[3] }
+            : undefined;
+    }
+
+    function getEffectSchemaRequestOpaqueType(type: TypeNode, modelName: string): TypeReferenceNode | undefined {
+        if (isEffectSchemaRequestOpaqueType(type, modelName)) return type;
+        if (type.kind !== SyntaxKind.IntersectionType) return;
+        for (const part of (type as IntersectionTypeNode).types) {
+            if (isEffectSchemaRequestOpaqueType(part, modelName)) return part;
+        }
+        return undefined;
+    }
+
+    function isEffectSchemaRequestOpaqueType(type: TypeNode, modelName: string): type is TypeReferenceNode {
+        if (type.kind !== SyntaxKind.TypeReference) return false;
+        const typeReference = type as TypeReferenceNode;
+        const typeName = typeReference.typeName;
+        if (typeName.kind !== SyntaxKind.QualifiedName) return false;
+        const qualifiedName = typeName as QualifiedName;
+        if (idText(qualifiedName.right) !== "Opaque" || qualifiedName.left.kind !== SyntaxKind.Identifier || idText(qualifiedName.left as Identifier) !== "S") return false;
+        const typeArguments = typeReference.typeArguments;
+        if (!typeArguments || typeArguments.length < 4) return false;
+        return isEffectSchemaNamedTypeReference(typeArguments[0], modelName)
+            && isEffectSchemaExtendedSchemaNoEncodedType(typeArguments[1]);
+    }
+
+    function isEffectSchemaNamedTypeReference(type: TypeNode, name: string) {
+        return type.kind === SyntaxKind.TypeReference
+            && (type as TypeReferenceNode).typeName.kind === SyntaxKind.Identifier
+            && idText((type as TypeReferenceNode).typeName as Identifier) === name;
+    }
+
+    function isEffectSchemaExtendedSchemaNoEncodedType(type: TypeNode) {
+        if (type.kind !== SyntaxKind.TypeQuery) return false;
+        const exprName = (type as TypeQueryNode).exprName;
+        return exprName.kind === SyntaxKind.QualifiedName
+            && idText((exprName as QualifiedName).right) === "ExtendedSchemaNoEncoded"
+            && (exprName as QualifiedName).left.kind === SyntaxKind.Identifier
+            && idText((exprName as QualifiedName).left as Identifier) === "S";
+    }
+
+    function updateEffectSchemaRequestBaseDeclaration(statement: Statement, info: EffectSchemaRequestBaseInfo): VariableStatement | undefined {
+        if (statement.kind !== SyntaxKind.VariableStatement) return;
+        const variableStatement = statement as VariableStatement;
+        const declaration = variableStatement.declarationList.declarations[0];
+        if (!declaration || declaration.name.kind !== SyntaxKind.Identifier || !declaration.type) return;
+        const updatedType = updateEffectSchemaRequestBaseType(declaration.type, info);
+        if (!updatedType) return;
+        const updatedDeclaration = factory.updateVariableDeclaration(
+            declaration,
+            declaration.name,
+            declaration.exclamationToken,
+            updatedType,
+            declaration.initializer,
+        );
+        return factory.updateVariableStatement(
+            variableStatement,
+            variableStatement.modifiers,
+            factory.updateVariableDeclarationList(variableStatement.declarationList, [updatedDeclaration]),
+        );
+    }
+
+    function updateEffectSchemaRequestBaseType(type: TypeNode, info: EffectSchemaRequestBaseInfo): TypeNode | undefined {
+        if (isEffectSchemaRequestOpaqueType(type, info.modelName)) {
+            return createEffectSchemaFacadeTypeReference(info.modelName, info.brandType);
+        }
+        if (type.kind !== SyntaxKind.IntersectionType) return;
+        let changed = false;
+        const types = map((type as IntersectionTypeNode).types, part => {
+            if (isEffectSchemaRequestOpaqueType(part, info.modelName)) {
+                changed = true;
+                return createEffectSchemaFacadeTypeReference(info.modelName, info.brandType);
+            }
+            return part;
+        });
+        return changed ? factory.updateIntersectionTypeNode(type as IntersectionTypeNode, factory.createNodeArray(types)) : undefined;
+    }
+
+    function needsEffectSchemaIntermediateClass(classDeclaration: ClassDeclaration) {
+        return classDeclaration.members.length > 0;
+    }
+
+    function createEffectSchemaIntermediateClass(modelName: string): ClassDeclaration {
+        const internalName = factory.createIdentifier(`__${modelName}`);
+        const baseName = factory.createIdentifier(`__${modelName}_base`);
+        return factory.createClassDeclaration(
+            [factory.createModifier(SyntaxKind.DeclareKeyword)],
+            internalName,
+            /*typeParameters*/ undefined,
+            [factory.createHeritageClause(SyntaxKind.ExtendsKeyword, [
+                factory.createExpressionWithTypeArguments(baseName, /*typeArguments*/ undefined),
+            ])],
+            [],
+        );
+    }
+
+    function updateEffectSchemaClassDeclaration(classDeclaration: ClassDeclaration, modelName: string): ClassDeclaration {
+        return factory.updateClassDeclaration(
+            classDeclaration,
+            classDeclaration.modifiers,
+            classDeclaration.name,
+            classDeclaration.typeParameters,
+            [factory.createHeritageClause(SyntaxKind.ExtendsKeyword, [
+                factory.createExpressionWithTypeArguments(factory.createIdentifier(`__${modelName}`), /*typeArguments*/ undefined),
+            ])],
+            classDeclaration.members,
+        );
+    }
+
+    function createEffectSchemaFacadeBaseType(modelName: string, classDeclaration: ClassDeclaration): TypeNode {
+        const schemaStaticMembers = createEffectSchemaStaticMembers(classDeclaration);
+        return factory.createIntersectionTypeNode([
+            createEffectSchemaFacadeTypeReference(modelName, factory.createTypeLiteralNode([])),
+            factory.createTypeLiteralNode(schemaStaticMembers),
+        ]);
+    }
+
+    function createEffectSchemaFacadeTypeReference(modelName: string, brandType: TypeNode): TypeReferenceNode {
+        const model = factory.createIdentifier(modelName);
+        const typeArguments: TypeNode[] = [
+            factory.createTypeReferenceNode(model),
+            factory.createTypeReferenceNode(factory.createQualifiedName(model, factory.createIdentifier("Encoded"))),
+            factory.createTypeReferenceNode(factory.createQualifiedName(model, factory.createIdentifier("Make"))),
+            factory.createTypeReferenceNode(factory.createQualifiedName(model, factory.createIdentifier("DecodingServices"))),
+            factory.createTypeReferenceNode(factory.createQualifiedName(model, factory.createIdentifier("EncodingServices"))),
+            brandType,
+        ];
+        const typeReference = factory.createTypeReferenceNode(factory.createQualifiedName(factory.createIdentifier("S"), factory.createIdentifier("OpaqueFacade")), typeArguments);
+        for (const typeArgument of typeArguments) {
+            setParent(typeArgument, typeReference);
+        }
+        return setParentRecursive(typeReference, /*incremental*/ false);
+    }
+
+    function createEffectSchemaStaticMembers(classDeclaration: ClassDeclaration): TypeElement[] {
+        const members: TypeElement[] = [];
+        addSchemaStaticMember(members, classDeclaration, "fields", /*readonly*/ true);
+        addSchemaStaticMember(members, classDeclaration, "mapFields", /*readonly*/ false);
+        addSchemaStaticMember(members, classDeclaration, "to", /*readonly*/ true);
+        addSchemaStaticMember(members, classDeclaration, "from", /*readonly*/ true);
+        addSchemaStaticMember(members, classDeclaration, "copy", /*readonly*/ true);
+        return members;
+    }
+
+    function addSchemaStaticMember(members: TypeElement[], classDeclaration: ClassDeclaration, name: string, isReadonly: boolean) {
+        const type = resolver.createTypeOfClassStaticProperty(classDeclaration, name, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        if (!type || type.kind === SyntaxKind.AnyKeyword) return;
+        members.push(factory.createPropertySignature(
+            isReadonly ? [factory.createModifier(SyntaxKind.ReadonlyKeyword)] : undefined,
+            name,
+            /*questionToken*/ undefined,
+            type,
+        ));
+    }
+
+    function getEffectSchemaServiceType(classDeclaration: ClassDeclaration, name: "DecodingServices" | "EncodingServices") {
+        const resolved = resolver.createTypeOfClassStaticProperty(classDeclaration, name, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        return resolved?.kind === SyntaxKind.AnyKeyword
+            ? factory.createKeywordTypeNode(SyntaxKind.NeverKeyword)
+            : resolved || factory.createKeywordTypeNode(SyntaxKind.NeverKeyword);
+    }
+
+    function expressionToEntityName(expression: Expression): EntityName | undefined {
+        if (expression.kind === SyntaxKind.Identifier) {
+            return expression as Identifier;
+        }
+        if (isPropertyAccessExpression(expression)) {
+            const left = expressionToEntityName(expression.expression);
+            if (!left || expression.name.kind !== SyntaxKind.Identifier) return;
+            return left && factory.createQualifiedName(left, expression.name);
+        }
+        return undefined;
     }
 }
 
