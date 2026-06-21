@@ -97,6 +97,7 @@ import {
     isBinaryExpression,
     isBindingElement,
     isBindingPattern,
+    isCallExpression,
     isClassDeclaration,
     isClassElement,
     isComputedPropertyName,
@@ -1930,10 +1931,11 @@ export function transformDeclarations(context: TransformationContext): Transform
                 classes.set(className, statement);
             }
         }
-        // A model is a class that has BOTH a source `namespace X { interface Encoded }` and a
-        // class declaration. (Bare `S.Opaque<X>` models without a source namespace are left as-is
-        // for now — see docs/planning/dts-emit-schema-codegen.md §5f.)
-        const modelNames = new Set<string>();
+        // Models = classes with a bare `S.Opaque<X>` source heritage (namespace synthesized from
+        // the class) UNION classes that carry a source `namespace X { interface Encoded }` (standard
+        // models incl. `S.Class`). This excludes requests / service tags / `TaggedClass` messages
+        // that merely resolve to an Opaque base but are neither `S.Opaque(...)` nor have a namespace.
+        const modelNames = collectEffectSchemaModelClassNames();
         for (const name of sourceNamespaces) {
             if (classes.has(name)) modelNames.add(name);
         }
@@ -1945,7 +1947,7 @@ export function transformDeclarations(context: TransformationContext): Transform
             const baseModelName = getEffectSchemaBaseModelName(statement);
             if (baseModelName && modelNames.has(baseModelName)) {
                 const classDeclaration = classes.get(baseModelName);
-                const updated = classDeclaration && updateEffectSchemaBaseDeclaration(statement, baseModelName, classDeclaration);
+                const updated = classDeclaration && updateEffectSchemaBaseDeclaration(statement, baseModelName, classDeclaration, /*withStatics*/ true);
                 if (updated) {
                     changed = true;
                     next.push(updated);
@@ -1963,18 +1965,65 @@ export function transformDeclarations(context: TransformationContext): Transform
             }
             const className = getEffectSchemaClassName(statement);
             if (className && modelNames.has(className)) {
+                const classDeclaration = statement as ClassDeclaration;
+                const extras: Statement[] = [];
                 if (!hasTopLevelInterface(statements, className)) {
-                    const typeInterface = createEffectSchemaTypeInterface(statement as ClassDeclaration);
-                    if (typeInterface) {
-                        changed = true;
-                        next.push(statement, typeInterface);
-                        continue;
-                    }
+                    const typeInterface = createEffectSchemaTypeInterface(classDeclaration);
+                    if (typeInterface) extras.push(typeInterface);
+                }
+                if (!sourceNamespaces.has(className)) {
+                    const namespaceDeclaration = createEffectSchemaNamespaceFromClass(classDeclaration);
+                    if (namespaceDeclaration) extras.push(namespaceDeclaration);
+                }
+                if (extras.length) {
+                    changed = true;
+                    next.push(statement, ...extras);
+                    continue;
                 }
             }
             next.push(statement);
         }
         return changed ? next : [...statements];
+    }
+
+    function createEffectSchemaNamespaceFromClass(classDeclaration: ClassDeclaration): ModuleDeclaration | undefined {
+        if (!classDeclaration.name) return;
+        const members: Statement[] = [];
+        const encoded = createEffectSchemaEncodedDeclaration(classDeclaration);
+        if (encoded) members.push(encoded);
+        const make = createEffectSchemaMakeDeclaration(classDeclaration);
+        if (make) members.push(make);
+        const decodingServices = createEffectSchemaServiceDeclaration(classDeclaration, "DecodingServices");
+        if (decodingServices) members.push(decodingServices);
+        const encodingServices = createEffectSchemaServiceDeclaration(classDeclaration, "EncodingServices");
+        if (encodingServices) members.push(encodingServices);
+        if (!members.length) return;
+        return factory.createModuleDeclaration(
+            [factory.createModifier(SyntaxKind.ExportKeyword), factory.createModifier(SyntaxKind.DeclareKeyword)],
+            factory.createIdentifier(idText(classDeclaration.name)),
+            factory.createModuleBlock(members),
+            NodeFlags.Namespace,
+        );
+    }
+
+    function createEffectSchemaEncodedDeclaration(classDeclaration: ClassDeclaration) {
+        const encodedType = resolver.createTypeOfClassStaticProperty(classDeclaration, "Encoded", enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        if (!encodedType || encodedType.kind === SyntaxKind.AnyKeyword) return;
+        if (isTypeLiteralNode(encodedType)) {
+            return factory.createInterfaceDeclaration(
+                /*modifiers*/ undefined,
+                factory.createIdentifier("Encoded"),
+                /*typeParameters*/ undefined,
+                /*heritageClauses*/ undefined,
+                encodedType.members,
+            );
+        }
+        return factory.createTypeAliasDeclaration(
+            /*modifiers*/ undefined,
+            factory.createIdentifier("Encoded"),
+            /*typeParameters*/ undefined,
+            encodedType,
+        );
     }
 
     function isEffectSchemaModelNamespace(statement: Statement): statement is ModuleDeclaration & { name: Identifier } {
@@ -2073,35 +2122,40 @@ export function transformDeclarations(context: TransformationContext): Transform
     }
 
     function isEffectSchemaOpaqueCtor(name: string): boolean {
+        // Only the Opaque family. NOT `Class`/`TaggedClass`: effect-app's `Req.Query`/`Req.Command`
+        // request builders resolve to those, and faceting a request breaks its request/invalidation
+        // typing. Real `S.Class` models carry a source namespace and are handled by the standard path.
         switch (name) {
             case "Opaque":
             case "OpaqueClass":
             case "OpaqueFacade":
-            case "Class":
-            case "TaggedClass":
                 return true;
             default:
                 return false;
         }
     }
 
+    // The model of any `X_base` const, from the base type's first type argument
+    // (the const itself has a generated, unreadable name): `S.Foo<Model, ...>` -> `Model`.
+    // The constructor is NOT gated here — callers gate by `modelNames`, which only contains real
+    // schema models (so a request's `GetMe_base` resolves a name but is never in `modelNames`).
     function getEffectSchemaBaseModelName(statement: Statement): string | undefined {
-        if (statement.kind !== SyntaxKind.VariableStatement) return;
-        const variableStatement = statement as VariableStatement;
-        if (variableStatement.declarationList.declarations.length !== 1) return;
-        const declaration = variableStatement.declarationList.declarations[0];
-        // The synthesized `X_base` const uses a generated identifier whose text isn't
-        // reliably readable, so detect the model from the base type's first type argument:
-        // `S.Opaque<Model, ...>` / `S.OpaqueFacade<Model, ...> & {...}` -> `Model`.
-        let typeNode = declaration.type;
-        if (typeNode && typeNode.kind === SyntaxKind.IntersectionType) {
-            typeNode = (typeNode as IntersectionTypeNode).types[0];
-        }
-        if (!typeNode || typeNode.kind !== SyntaxKind.TypeReference) return;
-        const typeRef = typeNode as TypeReferenceNode;
-        // Only schema model bases: `S.<Opaque-family>< Model, ... >`. Gating on the constructor
-        // namespace (`S`) + name excludes unrelated complex-heritage classes (Context.Service,
-        // Data.TaggedError, MiddlewareMaker.*, ...) that also get a synthesized `_base` const.
+        const typeRef = getEffectSchemaBaseTypeReference(statement);
+        if (!typeRef) return;
+        const firstArg = typeRef.typeArguments?.[0];
+        if (!firstArg || firstArg.kind !== SyntaxKind.TypeReference) return;
+        const firstName = (firstArg as TypeReferenceNode).typeName;
+        return firstName.kind === SyntaxKind.Identifier ? idText(firstName) : undefined;
+    }
+
+    // The model of a bare `S.Opaque<X>` base (which has no source namespace) -> `X`.
+    // Detects a plain schema model `S.Opaque<Self, Encoded, Schema>` (3 type args). Note: at .d.ts
+    // emit a `Req.Query`/`Req.Command` request (built by `TaggedRequestFor`) ALSO resolves to an
+    // `S.Opaque<...>` base, but with a 4th request-additional type arg (`S.Opaque<Self, Encoded,
+    // Schema, {}>`); excluding the 4-arg form keeps requests from being treated as models.
+    function getEffectSchemaOpaqueBaseModelName(statement: Statement): string | undefined {
+        const typeRef = getEffectSchemaBaseTypeReference(statement);
+        if (!typeRef) return;
         const ctor = typeRef.typeName;
         if (
             ctor.kind !== SyntaxKind.QualifiedName
@@ -2111,15 +2165,53 @@ export function transformDeclarations(context: TransformationContext): Transform
         ) {
             return;
         }
-        const firstArg = typeRef.typeArguments?.[0];
-        if (!firstArg || firstArg.kind !== SyntaxKind.TypeReference) return;
-        const firstName = (firstArg as TypeReferenceNode).typeName;
-        // First type arg of `S.Opaque<Model, ...>` is the model.
-        // (We only rewrite bases whose model also has a class declaration — gated by the caller.)
-        return firstName.kind === SyntaxKind.Identifier ? idText(firstName) : undefined;
+        return getEffectSchemaBaseModelName(statement);
     }
 
-    function updateEffectSchemaBaseDeclaration(statement: Statement, modelName: string, classDeclaration: ClassDeclaration): VariableStatement | undefined {
+    // Class names whose SOURCE heritage is an Effect schema model constructor — `S.Opaque(...)`,
+    // `S.Class(...)`, etc. This is a WHITELIST: at .d.ts emit many unrelated builders also resolve
+    // to an `S.Opaque<...>` base (`Req.Query`/`Req.Command` requests via `TaggedRequestFor`,
+    // `Context.assignTag` service tags, `Data.TaggedError`, ...), and faceting those breaks them.
+    // Only classes literally written `extends S.<schema-ctor>(...)` are real models. We read the
+    // ORIGINAL source classes (`currentSourceFile`) because TS has split the heritage off the
+    // transformed class by the time this pass runs.
+    function collectEffectSchemaModelClassNames(): Set<string> {
+        const models = new Set<string>();
+        for (const statement of currentSourceFile.statements) {
+            if (isClassDeclaration(statement) && statement.name && isEffectSchemaModelHeritage(statement)) {
+                models.add(idText(statement.name));
+            }
+        }
+        return models;
+    }
+
+    function isEffectSchemaModelHeritage(classDeclaration: ClassDeclaration): boolean {
+        const extendsClause = classDeclaration.heritageClauses?.find(clause => clause.token === SyntaxKind.ExtendsKeyword);
+        let expression: Expression | undefined = extendsClause?.types[0]?.expression;
+        // `S.Opaque<X>()(schema)` -> walk the call chain to the base property access `S.Opaque`.
+        // Only the Opaque family qualifies for from-class synthesis. `S.Class`/`S.TaggedClass`
+        // models that should be faceted carry a source namespace (handled separately); bare
+        // `S.TaggedClass` messages like `Heartbeat` are deliberately left alone.
+        while (expression && isCallExpression(expression)) expression = expression.expression;
+        return !!expression
+            && isPropertyAccessExpression(expression)
+            && expression.expression.kind === SyntaxKind.Identifier
+            && idText(expression.expression as Identifier) === "S"
+            && isEffectSchemaOpaqueCtor(idText(expression.name));
+    }
+
+    function getEffectSchemaBaseTypeReference(statement: Statement): TypeReferenceNode | undefined {
+        if (statement.kind !== SyntaxKind.VariableStatement) return;
+        const variableStatement = statement as VariableStatement;
+        if (variableStatement.declarationList.declarations.length !== 1) return;
+        let typeNode = variableStatement.declarationList.declarations[0].type;
+        if (typeNode && typeNode.kind === SyntaxKind.IntersectionType) {
+            typeNode = (typeNode as IntersectionTypeNode).types[0];
+        }
+        return typeNode && typeNode.kind === SyntaxKind.TypeReference ? typeNode as TypeReferenceNode : undefined;
+    }
+
+    function updateEffectSchemaBaseDeclaration(statement: Statement, modelName: string, classDeclaration: ClassDeclaration, withStatics: boolean): VariableStatement | undefined {
         if (statement.kind !== SyntaxKind.VariableStatement) return;
         const variableStatement = statement as VariableStatement;
         const declaration = variableStatement.declarationList.declarations[0];
@@ -2128,7 +2220,7 @@ export function transformDeclarations(context: TransformationContext): Transform
             declaration,
             declaration.name,
             declaration.exclamationToken,
-            createEffectSchemaFacadeBaseType(modelName, classDeclaration),
+            createEffectSchemaFacadeBaseType(modelName, classDeclaration, withStatics),
             declaration.initializer,
         );
         return factory.updateVariableStatement(
@@ -2138,22 +2230,23 @@ export function transformDeclarations(context: TransformationContext): Transform
         );
     }
 
-    function createEffectSchemaFacadeBaseType(modelName: string, classDeclaration: ClassDeclaration): TypeNode {
+    function createEffectSchemaFacadeBaseType(modelName: string, classDeclaration: ClassDeclaration, withStatics: boolean): TypeNode {
         const model = factory.createIdentifier(modelName);
-        const schemaStaticMembers = createEffectSchemaStaticMembers(classDeclaration);
         // Reference the namespace view members so the facade reads
         // `S.OpaqueFacade<X, X.Encoded, X.Make, X.DecodingServices, X.EncodingServices, {}>`.
         const view = (name: string) => factory.createTypeReferenceNode(factory.createQualifiedName(model, factory.createIdentifier(name)));
+        const facade = factory.createTypeReferenceNode(factory.createQualifiedName(factory.createIdentifier("S"), factory.createIdentifier("OpaqueFacade")), [
+            factory.createTypeReferenceNode(model),
+            view("Encoded"),
+            view("Make"),
+            view("DecodingServices"),
+            view("EncodingServices"),
+            factory.createTypeLiteralNode([]),
+        ]);
+        if (!withStatics) return facade;
         return factory.createIntersectionTypeNode([
-            factory.createTypeReferenceNode(factory.createQualifiedName(factory.createIdentifier("S"), factory.createIdentifier("OpaqueFacade")), [
-                factory.createTypeReferenceNode(model),
-                view("Encoded"),
-                view("Make"),
-                view("DecodingServices"),
-                view("EncodingServices"),
-                factory.createTypeLiteralNode([]),
-            ]),
-            factory.createTypeLiteralNode(schemaStaticMembers),
+            facade,
+            factory.createTypeLiteralNode(createEffectSchemaStaticMembers(classDeclaration)),
         ]);
     }
 
