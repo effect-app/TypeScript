@@ -2683,9 +2683,9 @@ export function transformDeclarations(context: TransformationContext): Transform
 
     function createEffectSchemaStaticMembers(classDeclaration: ClassDeclaration): TypeElement[] {
         const members: TypeElement[] = [];
-        // `identifier` is an `S.Class` static (the facade base is `S.Bottom`, which lacks it);
-        // carry it so the faceted class type stays equal to the stock `EnhancedClass` one.
-        addSchemaStaticMember(members, classDeclaration, "identifier", /*readonly*/ true);
+        // NOTE: `identifier` (generic `string`) is intentionally NOT emitted here — it lives on
+        // the facade interfaces (`OpaqueFacade`/`OpaqueClassFacade`/`OpaqueErrorFacadeClass`) in
+        // effect-app. Only per-model, precisely-typed statics belong here.
         addSchemaStaticMember(members, classDeclaration, "fields", /*readonly*/ true);
         addSchemaStaticMember(members, classDeclaration, "mapFields", /*readonly*/ false);
         addSchemaStaticMember(members, classDeclaration, "to", /*readonly*/ true);
