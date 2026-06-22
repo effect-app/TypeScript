@@ -2391,16 +2391,14 @@ export function transformDeclarations(context: TransformationContext): Transform
         return modifiers.length ? modifiers : undefined;
     }
 
-    // `import("#lib/StructFacade").StructFacade<X, X.Encoded, X.Make, X.DecodingServices,
-    // X.EncodingServices, X.Fields>` — a self-contained import type (no import statement to
-    // inject), resolved cross-package via the api package's `#lib/*` subpath import. The
-    // scanner-local facade extends `S.Struct<Fields>`, so the value stays Workflow-compatible.
+    // `S.StructFacade<X, X.Encoded, X.Make, X.DecodingServices, X.EncodingServices, X.Fields>`
+    // — `StructFacade` is exported from effect-app (>= 4.0.0-beta.279), so it resolves through the
+    // file's own `S` (effect-app/Schema) import, exactly like `S.OpaqueFacade`. It extends
+    // `S.Struct<Fields>`, so the faceted value stays Workflow-compatible.
     function createEffectSchemaStructFacadeType(modelName: string): TypeNode {
         const member = (name: string) => factory.createTypeReferenceNode(factory.createQualifiedName(factory.createIdentifier(modelName), factory.createIdentifier(name)));
-        return factory.createImportTypeNode(
-            factory.createLiteralTypeNode(factory.createStringLiteral("#lib/StructFacade")),
-            /*attributes*/ undefined,
-            factory.createIdentifier("StructFacade"),
+        return factory.createTypeReferenceNode(
+            factory.createQualifiedName(factory.createIdentifier("S"), factory.createIdentifier("StructFacade")),
             [
                 factory.createTypeReferenceNode(factory.createIdentifier(modelName)),
                 member("Encoded"),
@@ -2409,7 +2407,6 @@ export function transformDeclarations(context: TransformationContext): Transform
                 member("EncodingServices"),
                 member("Fields"),
             ],
-            /*isTypeOf*/ false,
         );
     }
 
