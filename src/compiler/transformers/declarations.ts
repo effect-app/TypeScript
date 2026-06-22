@@ -115,6 +115,7 @@ import {
     isFunctionLike,
     isGlobalScopeAugmentation,
     isIdentifierText,
+    isImportDeclaration,
     isImportEqualsDeclaration,
     isCallExpression,
     isIdentifier,
@@ -130,6 +131,7 @@ import {
     isMethodSignature,
     isModifier,
     isModuleDeclaration,
+    isNamedImports,
     isObjectLiteralExpression,
     isOmittedExpression,
     isParameter,
@@ -151,6 +153,7 @@ import {
     isTypeNode,
     isTypeParameterDeclaration,
     isTypeQueryNode,
+    isTypeReferenceNode,
     isVarAwaitUsing,
     isVariableDeclaration,
     isVariableStatement,
@@ -2172,9 +2175,68 @@ export function transformDeclarations(context: TransformationContext): Transform
         return some(statements, statement => isModuleDeclaration(statement) && statement.name.kind === SyntaxKind.Identifier && idText(statement.name) === name);
     }
 
+    interface GeneratedTypeImport {
+        importedName: string;
+        moduleSpecifier: string;
+    }
+
+    function getGeneratedTypeNamedImports(): Map<string, GeneratedTypeImport> {
+        const imports = new Map<string, GeneratedTypeImport>();
+        for (const statement of currentSourceFile.statements) {
+            if (!isImportDeclaration(statement) || !isStringLiteralLike(statement.moduleSpecifier)) continue;
+            const namedBindings = statement.importClause?.namedBindings;
+            if (!namedBindings || !isNamedImports(namedBindings)) continue;
+            for (const specifier of namedBindings.elements) {
+                const importedName = specifier.propertyName
+                    ? isIdentifier(specifier.propertyName) ? idText(specifier.propertyName) : specifier.propertyName.text
+                    : idText(specifier.name);
+                imports.set(idText(specifier.name), { importedName, moduleSpecifier: statement.moduleSpecifier.text });
+            }
+        }
+        return imports;
+    }
+
+    function getGeneratedTypeNamespaceImports(): Map<string, string> {
+        const imports = new Map<string, string>();
+        for (const statement of currentSourceFile.statements) {
+            if (!isImportDeclaration(statement) || !isStringLiteralLike(statement.moduleSpecifier)) continue;
+            const namedBindings = statement.importClause?.namedBindings;
+            if (namedBindings?.kind === SyntaxKind.NamespaceImport) {
+                imports.set(statement.moduleSpecifier.text, idText(namedBindings.name));
+            }
+        }
+        return imports;
+    }
+
+    function normalizeGeneratedImportedTypes<T extends TypeNode | undefined>(typeNode: T): T {
+        if (!typeNode) return typeNode;
+        const namedImports = getGeneratedTypeNamedImports();
+        if (!namedImports.size) return typeNode;
+        const namespaceImports = getGeneratedTypeNamespaceImports();
+        const visitor = (node: Node): VisitResult<Node> => {
+            if (isTypeReferenceNode(node) && isIdentifier(node.typeName)) {
+                const imported = namedImports.get(idText(node.typeName));
+                if (imported) {
+                    const typeArguments = visitNodes(node.typeArguments, visitor, isTypeNode);
+                    const namespaceName = namespaceImports.get(imported.moduleSpecifier);
+                    return namespaceName
+                        ? factory.createTypeReferenceNode(factory.createQualifiedName(factory.createIdentifier(namespaceName), factory.createIdentifier(imported.importedName)), typeArguments)
+                        : factory.createImportTypeNode(
+                            factory.createLiteralTypeNode(factory.createStringLiteral(imported.moduleSpecifier)),
+                            /*attributes*/ undefined,
+                            factory.createIdentifier(imported.importedName),
+                            typeArguments,
+                        );
+                }
+            }
+            return visitEachChild(node, visitor, context);
+        };
+        return visitNode(typeNode, visitor, isTypeNode) as T;
+    }
+
     function createEffectSchemaTypeInterface(classDeclaration: ClassDeclaration) {
         if (!classDeclaration.name) return;
-        const literal = resolver.createTypeLiteralOfClassDeclaration(classDeclaration, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        const literal = normalizeGeneratedImportedTypes(resolver.createTypeLiteralOfClassDeclaration(classDeclaration, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker));
         return literal && factory.createInterfaceDeclaration(
             createEffectSchemaNamespaceModifiers(classDeclaration, /*includeDeclare*/ false),
             classDeclaration.name,
@@ -2249,7 +2311,7 @@ export function transformDeclarations(context: TransformationContext): Transform
     }
 
     function createEffectSchemaEncodedDeclaration(classDeclaration: ClassDeclaration) {
-        const encodedType = resolver.createTypeOfClassStaticProperty(classDeclaration, "Encoded", enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        const encodedType = normalizeGeneratedImportedTypes(resolver.createTypeOfClassStaticProperty(classDeclaration, "Encoded", enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker));
         if (!encodedType) return;
         if (isTypeLiteralNode(encodedType)) {
             return factory.createInterfaceDeclaration(
@@ -2269,8 +2331,8 @@ export function transformDeclarations(context: TransformationContext): Transform
     }
 
     function createEffectSchemaMakeDeclaration(classDeclaration: ClassDeclaration) {
-        const makeType = resolver.createMakeTypeOfClassDeclaration(classDeclaration, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker)
-            || resolver.createTypeOfClassStaticProperty(classDeclaration, "~type.make.in", enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        const makeType = normalizeGeneratedImportedTypes(resolver.createMakeTypeOfClassDeclaration(classDeclaration, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker))
+            || normalizeGeneratedImportedTypes(resolver.createTypeOfClassStaticProperty(classDeclaration, "~type.make.in", enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker));
         if (!makeType) return;
         if (isTypeLiteralNode(makeType)) {
             return factory.createInterfaceDeclaration(
@@ -2290,7 +2352,7 @@ export function transformDeclarations(context: TransformationContext): Transform
     }
 
     function createEffectSchemaServiceDeclaration(classDeclaration: ClassDeclaration, name: "DecodingServices" | "EncodingServices") {
-        const resolved = resolver.createTypeOfClassStaticProperty(classDeclaration, name, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        const resolved = normalizeGeneratedImportedTypes(resolver.createTypeOfClassStaticProperty(classDeclaration, name, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker));
         const serviceType = resolved?.kind === SyntaxKind.AnyKeyword ? factory.createKeywordTypeNode(SyntaxKind.NeverKeyword) : resolved;
         return serviceType && factory.createTypeAliasDeclaration(
             /*modifiers*/ undefined,
@@ -2356,7 +2418,7 @@ export function transformDeclarations(context: TransformationContext): Transform
     function materializeEffectSchemaStructProperty(modelName: string, propertyName: string): TypeNode | undefined {
         const declaration = getEffectSchemaSourceStructDeclaration(modelName);
         if (!declaration) return undefined;
-        return resolver.createTypeOfStructSchemaProperty(declaration, propertyName, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        return normalizeGeneratedImportedTypes(resolver.createTypeOfStructSchemaProperty(declaration, propertyName, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker));
     }
 
     function canCreateEffectSchemaGeneratedStructNamespace(modelName: string): boolean {
@@ -2692,7 +2754,7 @@ export function transformDeclarations(context: TransformationContext): Transform
     }
 
     function addSchemaStaticMember(members: TypeElement[], classDeclaration: ClassDeclaration, name: string, isReadonly: boolean) {
-        const type = resolver.createTypeOfClassStaticProperty(classDeclaration, name, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        const type = normalizeGeneratedImportedTypes(resolver.createTypeOfClassStaticProperty(classDeclaration, name, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker));
         if (!type || type.kind === SyntaxKind.AnyKeyword) return;
         members.push(factory.createPropertySignature(
             isReadonly ? [factory.createModifier(SyntaxKind.ReadonlyKeyword)] : undefined,
@@ -2703,7 +2765,7 @@ export function transformDeclarations(context: TransformationContext): Transform
     }
 
     function getEffectSchemaServiceType(classDeclaration: ClassDeclaration, name: "DecodingServices" | "EncodingServices") {
-        const resolved = resolver.createTypeOfClassStaticProperty(classDeclaration, name, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+        const resolved = normalizeGeneratedImportedTypes(resolver.createTypeOfClassStaticProperty(classDeclaration, name, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker));
         return resolved?.kind === SyntaxKind.AnyKeyword
             ? factory.createKeywordTypeNode(SyntaxKind.NeverKeyword)
             : resolved || factory.createKeywordTypeNode(SyntaxKind.NeverKeyword);
