@@ -1919,6 +1919,12 @@ export function transformDeclarations(context: TransformationContext): Transform
             && heritageType.typeArguments[0].kind === SyntaxKind.TypeQuery;
     }
 
+    function isEffectSchemaStructNestedEncodedInterfaceForModel(statement: Statement, modelName: string): statement is InterfaceDeclaration {
+        if (!isEffectSchemaStructNestedEncodedInterface(statement)) return false;
+        const typeQuery = statement.heritageClauses![0].types[0].typeArguments![0] as TypeQueryNode;
+        return isIdentifier(typeQuery.exprName) && idText(typeQuery.exprName) === modelName;
+    }
+
     function materializeSchemaNestedEncoded(encoded: InterfaceDeclaration) {
         const heritageType = encoded.heritageClauses![0].types[0];
         const typeName = expressionToEntityName(heritageType.expression);
@@ -1926,6 +1932,17 @@ export function transformDeclarations(context: TransformationContext): Transform
         const typeNode = factory.createTypeReferenceNode(typeName, heritageType.typeArguments);
         setParent(typeNode, encoded);
         return resolver.createTypeLiteralOfTypeNode(typeNode, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker);
+    }
+
+    function createEffectSchemaMaterializedEncodedDeclaration(encoded: InterfaceDeclaration) {
+        const encodedLiteral = materializeSchemaNestedEncoded(encoded);
+        return encodedLiteral && factory.createInterfaceDeclaration(
+            encoded.modifiers,
+            encoded.name,
+            encoded.typeParameters,
+            /*heritageClauses*/ undefined,
+            encodedLiteral.members,
+        );
     }
 
     function createEffectSchemaSourceFileDeclarations(statements: NodeArray<Statement>): Statement[] {
@@ -2249,13 +2266,27 @@ export function transformDeclarations(context: TransformationContext): Transform
     function updateEffectSchemaNamespaceDeclaration(namespace: ModuleDeclaration & { name: Identifier }, classDeclaration: ClassDeclaration) {
         const body = namespace.body;
         if (!body || body.kind !== SyntaxKind.ModuleBlock) return;
+        let replacedEncoded = false;
         const existing = new Set<string>();
         const kept: Statement[] = [];
         for (const statement of body.statements) {
-            if ((isInterfaceDeclaration(statement) || isTypeAliasDeclaration(statement)) && idText(statement.name) !== "Encoded") {
-                existing.add(idText(statement.name));
-                if (idText(statement.name) === "Make" || idText(statement.name) === "DecodingServices" || idText(statement.name) === "EncodingServices") {
-                    continue;
+            if (isInterfaceDeclaration(statement) || isTypeAliasDeclaration(statement)) {
+                const name = idText(statement.name);
+                if (name === "Encoded") {
+                    const encodedDeclaration = isEffectSchemaStructNestedEncodedInterfaceForModel(statement, idText(namespace.name))
+                        ? createEffectSchemaMaterializedEncodedDeclaration(statement)
+                        : undefined;
+                    if (encodedDeclaration) {
+                        kept.push(encodedDeclaration);
+                        replacedEncoded = true;
+                        continue;
+                    }
+                }
+                else {
+                    existing.add(name);
+                    if (name === "Make" || name === "DecodingServices" || name === "EncodingServices") {
+                        continue;
+                    }
                 }
             }
             kept.push(statement);
@@ -2267,7 +2298,7 @@ export function transformDeclarations(context: TransformationContext): Transform
         if (makeDeclaration) additions.push(makeDeclaration);
         if (decodingServices) additions.push(decodingServices);
         if (encodingServices) additions.push(encodingServices);
-        if (!additions.length && existing.size === 0) return;
+        if (!replacedEncoded && !additions.length && existing.size === 0) return;
         return factory.updateModuleDeclaration(
             namespace,
             namespace.modifiers,
