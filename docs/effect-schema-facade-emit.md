@@ -90,6 +90,23 @@ saving **scales with the number of programs / project references / parallel chec
 them, the larger the absolute win. A monorepo with many project references is the worst case for
 stock and the best case for the facade.
 
+### Not just performance — correctness
+
+This is **also a correctness fix**, not only a speed-up. When the schema generics get deep/complex
+enough, the checker hits its instantiation/depth limits and **silently** falls back to `unknown` /
+`any` for whole views — `DecodingServices` / `EncodingServices`, constructor / `make` members, the
+decoded `Type` and `Encoded`. There is **no error**: the program type-checks green against a degraded
+type. In large projects this is worse, and it is **non-deterministic** — it depends on checker /
+project / worker state, so it shows up most under **tsgo's default multi-threaded mode** (each worker
+hits the wall independently) and can differ run-to-run.
+
+Because the facade materializes every view as a **named literal interface once at emit**, consumers
+read fully-resolved types instead of re-deriving (and giving up on) them — the views are stable and
+correct regardless of program count or worker. Switching the scanner onto this surfaced **several
+real bugs** that the silent `any`/`unknown` had been masking (missing required services, wrong
+make-input shapes, fields that had silently widened). So the facade both cuts instantiations and
+**removes a class of silent, non-deterministic type degradations**.
+
 ---
 
 ## How
