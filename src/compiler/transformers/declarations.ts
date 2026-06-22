@@ -2294,7 +2294,9 @@ export function transformDeclarations(context: TransformationContext): Transform
         const makeDeclaration = createEffectSchemaMakeDeclaration(classDeclaration);
         const decodingServices = createEffectSchemaServiceDeclaration(classDeclaration, "DecodingServices");
         const encodingServices = createEffectSchemaServiceDeclaration(classDeclaration, "EncodingServices");
+        const fieldsDeclaration = existing.has("Fields") ? undefined : createEffectSchemaFieldsDeclaration(classDeclaration);
         const additions: Statement[] = [];
+        if (fieldsDeclaration) additions.push(fieldsDeclaration);
         if (makeDeclaration) additions.push(makeDeclaration);
         if (decodingServices) additions.push(decodingServices);
         if (encodingServices) additions.push(encodingServices);
@@ -2310,6 +2312,7 @@ export function transformDeclarations(context: TransformationContext): Transform
     function createEffectSchemaGeneratedNamespaceDeclaration(modelName: string, classDeclaration: ClassDeclaration) {
         const encodedDeclaration = createEffectSchemaEncodedDeclaration(classDeclaration);
         if (!encodedDeclaration) return;
+        const fieldsDeclaration = createEffectSchemaFieldsDeclaration(classDeclaration);
         const makeDeclaration = createEffectSchemaMakeDeclaration(classDeclaration);
         const decodingServices = createEffectSchemaServiceDeclaration(classDeclaration, "DecodingServices");
         const encodingServices = createEffectSchemaServiceDeclaration(classDeclaration, "EncodingServices");
@@ -2318,6 +2321,7 @@ export function transformDeclarations(context: TransformationContext): Transform
             factory.createIdentifier(modelName),
             factory.createModuleBlock(factory.createNodeArray([
                 encodedDeclaration,
+                ...(fieldsDeclaration ? [fieldsDeclaration] : []),
                 ...(makeDeclaration ? [makeDeclaration] : []),
                 ...(decodingServices ? [decodingServices] : []),
                 ...(encodingServices ? [encodingServices] : []),
@@ -2339,6 +2343,26 @@ export function transformDeclarations(context: TransformationContext): Transform
 
     function hasEffectSchemaSyntacticModifier(node: ClassDeclaration, kind: SyntaxKind) {
         return !!node.modifiers && some(node.modifiers, modifier => modifier.kind === kind);
+    }
+
+    function createEffectSchemaFieldsDeclaration(classDeclaration: ClassDeclaration) {
+        const fieldsType = normalizeGeneratedImportedTypes(resolver.createTypeOfClassStaticProperty(classDeclaration, "fields", enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker));
+        if (!fieldsType || fieldsType.kind === SyntaxKind.AnyKeyword) return;
+        if (isTypeLiteralNode(fieldsType)) {
+            return factory.createInterfaceDeclaration(
+                /*modifiers*/ undefined,
+                factory.createIdentifier("Fields"),
+                /*typeParameters*/ undefined,
+                /*heritageClauses*/ undefined,
+                fieldsType.members,
+            );
+        }
+        return factory.createTypeAliasDeclaration(
+            /*modifiers*/ undefined,
+            factory.createIdentifier("Fields"),
+            /*typeParameters*/ undefined,
+            fieldsType,
+        );
     }
 
     function createEffectSchemaEncodedDeclaration(classDeclaration: ClassDeclaration) {
@@ -2734,7 +2758,7 @@ export function transformDeclarations(context: TransformationContext): Transform
     function createEffectSchemaFacadeBaseType(modelName: string, classDeclaration: ClassDeclaration, baseType: TypeNode | undefined): TypeNode {
         const facadeName = getEffectSchemaClassFacadeName(classDeclaration);
         const brandType = getEffectSchemaFacadeBrandType(baseType, facadeName);
-        const schemaStaticMembers = createEffectSchemaStaticMembers(classDeclaration);
+        const schemaStaticMembers = createEffectSchemaStaticMembers(classDeclaration, modelName);
         return factory.createIntersectionTypeNode([
             createEffectSchemaFacadeTypeReference(modelName, brandType, facadeName),
             factory.createTypeLiteralNode(schemaStaticMembers),
@@ -2771,27 +2795,105 @@ export function transformDeclarations(context: TransformationContext): Transform
         return setParentRecursive(typeReference, /*incremental*/ false);
     }
 
-    function createEffectSchemaStaticMembers(classDeclaration: ClassDeclaration): TypeElement[] {
+    function createEffectSchemaStaticMembers(classDeclaration: ClassDeclaration, modelName: string): TypeElement[] {
         const members: TypeElement[] = [];
+        const hasFields = !!createEffectSchemaFieldsDeclaration(classDeclaration);
         // NOTE: `identifier` (generic `string`) is intentionally NOT emitted here — it lives on
         // the facade interfaces (`OpaqueFacade`/`OpaqueClassFacade`/`OpaqueErrorFacadeClass`) in
         // effect-app. Only per-model, precisely-typed statics belong here.
-        addSchemaStaticMember(members, classDeclaration, "fields", /*readonly*/ true);
-        addSchemaStaticMember(members, classDeclaration, "mapFields", /*readonly*/ false);
+        addSchemaStaticMember(members, classDeclaration, "fields", /*readonly*/ true, hasFields ? modelName : undefined);
+        addSchemaStaticMember(members, classDeclaration, "mapFields", /*readonly*/ false, hasFields ? modelName : undefined);
         addSchemaStaticMember(members, classDeclaration, "to", /*readonly*/ true);
         addSchemaStaticMember(members, classDeclaration, "from", /*readonly*/ true);
-        addSchemaStaticMember(members, classDeclaration, "copy", /*readonly*/ true);
+        addSchemaStaticMember(members, classDeclaration, "copy", /*readonly*/ true, modelName);
         return members;
     }
 
-    function addSchemaStaticMember(members: TypeElement[], classDeclaration: ClassDeclaration, name: string, isReadonly: boolean) {
+    function createEffectSchemaNamedMemberReference(modelName: string, memberName: string): TypeReferenceNode {
+        return factory.createTypeReferenceNode(factory.createQualifiedName(factory.createIdentifier(modelName), factory.createIdentifier(memberName)));
+    }
+
+    function rewriteEffectSchemaStaticMemberType(type: TypeNode, name: string, modelName: string): TypeNode {
+        switch (name) {
+            case "fields":
+                return createEffectSchemaNamedMemberReference(modelName, "Fields");
+            case "mapFields":
+                return rewriteEffectSchemaMapFieldsType(type, modelName);
+            case "copy":
+                return rewriteEffectSchemaCopyType(type, modelName);
+            default:
+                return type;
+        }
+    }
+
+    function rewriteEffectSchemaMapFieldsType(type: TypeNode, modelName: string): TypeNode {
+        if (type.kind !== SyntaxKind.FunctionType) return type;
+        const mapFieldsType = type as FunctionTypeNode;
+        const callbackParameter = mapFieldsType.parameters[0];
+        if (!callbackParameter?.type || callbackParameter.type.kind !== SyntaxKind.FunctionType) return type;
+        const callbackType = callbackParameter.type as FunctionTypeNode;
+        const fieldsParameter = callbackType.parameters[0];
+        if (!fieldsParameter) return type;
+
+        const updatedFieldsParameter = factory.updateParameterDeclaration(
+            fieldsParameter,
+            fieldsParameter.modifiers,
+            fieldsParameter.dotDotDotToken,
+            fieldsParameter.name,
+            fieldsParameter.questionToken,
+            createEffectSchemaNamedMemberReference(modelName, "Fields"),
+            fieldsParameter.initializer,
+        );
+        const updatedCallbackType = factory.updateFunctionTypeNode(
+            callbackType,
+            callbackType.typeParameters,
+            factory.createNodeArray([updatedFieldsParameter, ...callbackType.parameters.slice(1)]),
+            callbackType.type,
+        );
+        const updatedCallbackParameter = factory.updateParameterDeclaration(
+            callbackParameter,
+            callbackParameter.modifiers,
+            callbackParameter.dotDotDotToken,
+            callbackParameter.name,
+            callbackParameter.questionToken,
+            updatedCallbackType,
+            callbackParameter.initializer,
+        );
+        return factory.updateFunctionTypeNode(
+            mapFieldsType,
+            mapFieldsType.typeParameters,
+            factory.createNodeArray([updatedCallbackParameter, ...mapFieldsType.parameters.slice(1)]),
+            mapFieldsType.type,
+        );
+    }
+
+    function rewriteEffectSchemaCopyType(type: TypeNode, modelName: string): TypeNode {
+        const model = factory.createTypeReferenceNode(factory.createIdentifier(modelName));
+        if (type.kind === SyntaxKind.ImportType) {
+            const importType = type as ImportTypeNode;
+            if (importType.qualifier && rightmostEntityNameText(importType.qualifier) === "StructuralCopyOrigin") {
+                return factory.updateImportTypeNode(importType, importType.argument, importType.attributes, importType.qualifier, [model], importType.isTypeOf);
+            }
+            return type;
+        }
+        if (isTypeReferenceNode(type) && rightmostEntityNameText(type.typeName) === "StructuralCopyOrigin") {
+            return factory.updateTypeReferenceNode(type, type.typeName, factory.createNodeArray([model]));
+        }
+        return type;
+    }
+
+    function rightmostEntityNameText(name: EntityName): string {
+        return name.kind === SyntaxKind.Identifier ? idText(name) : idText(name.right);
+    }
+
+    function addSchemaStaticMember(members: TypeElement[], classDeclaration: ClassDeclaration, name: string, isReadonly: boolean, modelName?: string) {
         const type = normalizeGeneratedImportedTypes(resolver.createTypeOfClassStaticProperty(classDeclaration, name, enclosingDeclaration, declarationEmitNodeBuilderFlags, declarationEmitInternalNodeBuilderFlags, symbolTracker));
         if (!type || type.kind === SyntaxKind.AnyKeyword) return;
         members.push(factory.createPropertySignature(
             isReadonly ? [factory.createModifier(SyntaxKind.ReadonlyKeyword)] : undefined,
             name,
             /*questionToken*/ undefined,
-            type,
+            modelName ? rewriteEffectSchemaStaticMemberType(type, name, modelName) : type,
         ));
     }
 
