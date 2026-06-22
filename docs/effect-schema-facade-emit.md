@@ -141,6 +141,6 @@ The change also composes with Effect's tooling:
 
 ## Related
 
-- effect-app/TypeScript#3 (this fork), effect-app/typescript-go#2, effect-app/tsgo#1 (patches).
-- effect-app/libs#801 (facade `identifier` + `StructFacade`) + the `StructFacade` effect-app-`Struct` fix on `main`.
-- Full plan / measurements / fork-layering: scanner `docs/planning/dts-emit-schema-codegen.md`.
+- [effect-app/TypeScript#3](https://github.com/effect-app/TypeScript/pull/3) (this fork) — Go mirror [effect-app/typescript-go#2](https://github.com/effect-app/typescript-go/pull/2); patch form [effect-app/tsgo#1](https://github.com/effect-app/tsgo/pull/1).
+- [effect-app/libs#801](https://github.com/effect-app/libs/pull/801) (facade `identifier` + `StructFacade`) + the `StructFacade` effect-app-`Struct` fix on [`main`](https://github.com/effect-app/libs/commits/main).
+- Full plan / measurements / fork-layering: scanner [macs-holding/scanner#1597](https://github.com/macs-holding/scanner/pull/1597) (`docs/planning/dts-emit-schema-codegen.md`).
