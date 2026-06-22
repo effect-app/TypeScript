@@ -70,6 +70,26 @@ Bottom field from `fields` — `Type`/`Encoded`/`Make`/`DecodingServices`/`Encod
 to the named namespace interfaces; `ast`/`Rebuild`/`Iso`/`~type.parameters`/variance markers are
 fixed to constants/`Self`.
 
+### Why the win compounds — there is no cross-program instantiation cache
+
+TypeScript's type-instantiation cache is **per `Program`**, not global. Every `Program` re-checks
+the `.d.ts` of its dependencies from scratch and re-instantiates each schema generic it touches.
+So the dynamic-type cost is paid **once per program that sees the model**, and a codebase multiplies
+programs:
+
+- **Project references** — each referenced project is its own `Program`; a model in a shared package
+  is re-instantiated in every downstream project that imports it.
+- **Multi-threaded checking** — each parallel checker has its own cache (tsgo multi ≈ 2.2× the
+  instantiations of single-threaded; §2a), so the cost is paid per worker too.
+- **Editor + `tsc` + build + test configs** — each is another program over the same files.
+
+A stock model's base inlines `S.Struct<{…full…}>` and its `Encoded`/`Type` are conditional, so
+**N programs = N re-derivations** of the same shapes. The facade collapses the model to named
+interfaces materialized **once** at emit; each program then reads cheap literals by name. Hence the
+saving **scales with the number of programs / project references / parallel checkers** — the more of
+them, the larger the absolute win. A monorepo with many project references is the worst case for
+stock and the best case for the facade.
+
 ---
 
 ## How
